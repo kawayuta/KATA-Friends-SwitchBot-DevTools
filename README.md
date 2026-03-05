@@ -548,6 +548,8 @@ Content-Type: application/json
 
 Response: `Title/Diary content/Emotion`
 
+> **Note:** The diary server also accepts `task: "custom"`. When task is `"custom"`, no system prompt is loaded (returns empty string), allowing the Custom LLM tab to bypass diary/translation system prompts entirely. Set `"task": "custom"` in the Custom LLM config JSON to use only the custom prompt template.
+
 ### Diary Emotions
 
 `Happy`, `Excited`, `Relaxed`, `Curious`, `Loved`, `Sleepy`, `Sad`, `Scared`, `Angry`, `Lonely`
@@ -632,6 +634,8 @@ Role:翻译专家
     - 中文文本格式为：Title / Body / Emotion（标题 / 正文 / 情绪）。
     - 输出需将标题和正文翻译为目标语言，情绪标签保持英文，并严格保持 ... / ... / ... 的格式。
 ```
+
+> **Note:** The original translation prompt's `Title / Body / Emotion` label caused the model to echo it as a header, producing multi-line output that failed format validation. The updated prompt emphasizes single-line output, 3 parts separated by `/`, includes a concrete output example, and appends `/no_think`. Additionally, `route.py` has a fallback: if translation returns only 2 parts (missing emotion), the Chinese emotion tag is used automatically.
 
 ## Face Recognition Data
 
