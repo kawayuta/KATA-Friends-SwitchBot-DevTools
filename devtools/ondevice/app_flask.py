@@ -377,7 +377,7 @@ def custom_llm_call():
 
     # Call diary server with retries
     payload = {
-        "task": config.get("task", "diary"),
+        "task": config.get("task", "custom"),
         "prompt": filled,
         "temperature": float(config.get("temperature", 1.3)),
         "max_new_tokens": int(config.get("max_new_tokens", 4096)),
