@@ -245,6 +245,42 @@
         <label class="text-sm text-gray-400 flex items-center gap-1">
           <input type="checkbox" id="custom-use-camera" class="accent-indigo-500"> カメラ (VLM)
         </label>
+        <label class="text-sm text-gray-400 flex items-center gap-1">
+          <input type="checkbox" id="custom-tts" class="accent-indigo-500" onchange="toggleTtsOptions()"> 読み上げ (TTS)
+        </label>
+      </div>
+      <div id="tts-options" class="mb-3 hidden">
+        <div class="flex flex-wrap items-center gap-x-4 gap-y-2">
+          <div class="flex items-center gap-2">
+            <label class="text-xs text-gray-400">再生先</label>
+            <select id="tts-playback" class="bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm">
+              <option value="browser">ブラウザ</option>
+              <option value="device">デバイス</option>
+              <option value="both">両方</option>
+            </select>
+          </div>
+          <div class="flex items-center gap-2">
+            <label class="text-xs text-gray-400">Voice</label>
+            <select id="tts-voice" class="bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm"></select>
+          </div>
+          <div class="flex items-center gap-2">
+            <label class="text-xs text-gray-400">速度</label>
+            <select id="tts-rate" class="bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm">
+              <option value="-50%">0.5x</option>
+              <option value="-25%">0.75x</option>
+              <option value="+0%" selected>1x</option>
+              <option value="+25%">1.25x</option>
+              <option value="+50%">1.5x</option>
+              <option value="+100%">2x</option>
+            </select>
+          </div>
+          <div class="flex items-center gap-2">
+            <label class="text-xs text-gray-400">ピッチ</label>
+            <input type="range" id="tts-pitch" min="-100" max="100" value="0" step="5" class="w-24 accent-kata-500" oninput="document.getElementById('tts-pitch-val').textContent=(this.value>0?'+':'')+this.value+'Hz'">
+            <span id="tts-pitch-val" class="text-xs text-gray-400 w-12">+0Hz</span>
+          </div>
+          <button onclick="saveTtsConfig()" id="tts-save-btn" class="bg-gray-700 hover:bg-gray-600 text-xs px-3 py-1 rounded">デフォルトに保存</button>
+        </div>
       </div>
       <p class="text-xs text-gray-500 mb-3">Prompt タブの「Custom LLM プロンプト」にテンプレートを設定。入力テキストが <code class="text-gray-400">{text}</code> に代入されます。カメラONでカメラ映像+テキストをVLM (Qwen3-VL-2B) に送信。</p>
       <div id="custom-result" class="bg-gray-800 rounded p-4 min-h-[100px] hidden">
@@ -474,11 +510,58 @@ async function executeAction(preset) {
   setLoading('action-exec', false);
 }
 
+// --- TTS (edge-tts) ---
+function toggleTtsOptions() {
+  const on = document.getElementById('custom-tts').checked;
+  document.getElementById('tts-options').classList.toggle('hidden', !on);
+}
+
+function ttsPitchStr() {
+  const v = parseInt(document.getElementById('tts-pitch').value);
+  return (v >= 0 ? '+' : '') + v + 'Hz';
+}
+
+async function saveTtsConfig() {
+  const btn = document.getElementById('tts-save-btn');
+  const cfg = {
+    voice: document.getElementById('tts-voice').value,
+    rate: document.getElementById('tts-rate').value,
+    pitch: ttsPitchStr(),
+    playback: document.getElementById('tts-playback').value,
+  };
+  try {
+    await apiCall('/api/tts/config', { method: 'POST', body: JSON.stringify(cfg) });
+    btn.textContent = '保存済'; setTimeout(() => { btn.textContent = 'デフォルトに保存'; }, 1500);
+  } catch (_) {}
+}
+
+async function loadTtsOptions() {
+  try {
+    const data = await apiCall('/api/tts/options');
+    const cfg = data.config || {};
+    const voiceSel = document.getElementById('tts-voice');
+    (data.voices || []).forEach(v => {
+      const o = document.createElement('option');
+      o.value = v; o.textContent = v;
+      voiceSel.appendChild(o);
+    });
+    voiceSel.value = cfg.voice || 'ja-JP-NanamiNeural';
+    if (cfg.rate) document.getElementById('tts-rate').value = cfg.rate;
+    if (cfg.pitch) {
+      const pv = parseInt(cfg.pitch);
+      document.getElementById('tts-pitch').value = pv;
+      document.getElementById('tts-pitch-val').textContent = (pv >= 0 ? '+' : '') + pv + 'Hz';
+    }
+    if (cfg.playback) document.getElementById('tts-playback').value = cfg.playback;
+  } catch (e) { console.error('loadTtsOptions failed:', e); }
+}
+
 // --- Custom LLM ---
 async function callCustomLLM() {
   const text = document.getElementById('custom-input').value.trim();
   if (!text) return;
   const useCamera = document.getElementById('custom-use-camera').checked;
+  const useTts = document.getElementById('custom-tts').checked;
   setLoading('custom-send', true);
   const resultEl = document.getElementById('custom-result');
   resultEl.classList.remove('hidden');
@@ -492,7 +575,47 @@ async function callCustomLLM() {
       resultEl.querySelector('pre').textContent = 'エラー: ' + data.error;
     } else {
       const modeLabel = data.mode === 'vlm' ? '[VLM] ' : '';
-      resultEl.querySelector('pre').textContent = modeLabel + (data.result || '(empty response)');
+      const resultText = data.result || '(empty response)';
+      resultEl.querySelector('pre').textContent = modeLabel + resultText;
+
+      if (useTts && resultText && resultText !== '(empty response)') {
+        const playback = document.getElementById('tts-playback').value;
+        resultEl.querySelector('pre').textContent += '\n\n(読み上げ中...)';
+        try {
+          const ttsBase = {
+            text: resultText,
+            voice: document.getElementById('tts-voice').value,
+            rate: document.getElementById('tts-rate').value,
+            pitch: ttsPitchStr(),
+          };
+          const doBrowser = playback === 'browser' || playback === 'both';
+          const doDevice = playback === 'device' || playback === 'both';
+          if (doDevice && !doBrowser) {
+            await apiCall('/api/tts', { method: 'POST', body: JSON.stringify({ ...ttsBase, browser: false }) });
+          } else if (doBrowser) {
+            const res = await fetch('/api/tts', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ ...ttsBase, browser: true }),
+            });
+            if (!res.ok) {
+              const err = await res.json().catch(() => ({}));
+              throw new Error(err.detail || 'TTS API error ' + res.status);
+            }
+            const blob = await res.blob();
+            const url = URL.createObjectURL(blob);
+            const audio = new Audio(url);
+            audio.onended = () => URL.revokeObjectURL(url);
+            audio.play();
+            if (doDevice) {
+              await apiCall('/api/tts', { method: 'POST', body: JSON.stringify({ ...ttsBase, browser: false }) });
+            }
+          }
+          resultEl.querySelector('pre').textContent = modeLabel + resultText + '\n\n(読み上げ完了)';
+        } catch (te) {
+          resultEl.querySelector('pre').textContent = modeLabel + resultText + '\n\nTTSエラー: ' + te.message;
+        }
+      }
     }
     const preview = document.getElementById('custom-prompt-preview');
     if (data.prompt) {
@@ -1825,7 +1948,7 @@ function truncBody(obj, max = 300) {
   return s.length > max ? s.slice(0, max) + '...' : s;
 }
 
-document.addEventListener('DOMContentLoaded', initLogPanel);
+document.addEventListener('DOMContentLoaded', () => { initLogPanel(); loadTtsOptions(); });
 </script>
 
   <!-- Log Panel -->

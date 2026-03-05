@@ -15,7 +15,7 @@ import time
 import uuid
 
 import requests
-from flask import Flask, abort, jsonify, request, send_from_directory
+from flask import Flask, Response, abort, jsonify, request, send_from_directory
 
 # --- Config ---
 # On-device: everything is localhost
@@ -1475,6 +1475,92 @@ def get_events():
         except json.JSONDecodeError:
             pass
     return jsonify({"events": list(reversed(events)), "total": len(lines)})
+
+
+# --- TTS (edge-tts) ---
+
+import asyncio
+
+TTS_VOICES = [
+    "ja-JP-NanamiNeural",
+    "ja-JP-KeitaNeural",
+    "en-US-AriaNeural",
+    "en-US-GuyNeural",
+    "en-US-JennyNeural",
+    "en-US-BrianNeural",
+    "en-US-AvaNeural",
+    "en-US-AndrewNeural",
+    "en-US-EmmaNeural",
+    "en-US-ChristopherNeural",
+    "en-US-EricNeural",
+    "en-US-MichelleNeural",
+    "en-US-RogerNeural",
+]
+
+TTS_CONFIG_PATH = "/data/devtools/tts_config.json"
+
+
+def _load_tts_config():
+    try:
+        with open(TTS_CONFIG_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_tts_config(cfg):
+    with open(TTS_CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+
+@app.get("/api/tts/options")
+def tts_options():
+    cfg = _load_tts_config()
+    return jsonify({"voices": TTS_VOICES, "config": cfg})
+
+
+@app.post("/api/tts/config")
+def tts_config_save():
+    data = request.get_json(force=True)
+    cfg = {
+        "voice": data.get("voice", "ja-JP-NanamiNeural"),
+        "rate": data.get("rate", "+0%"),
+        "pitch": data.get("pitch", "+0Hz"),
+        "playback": data.get("playback", "browser"),
+    }
+    _save_tts_config(cfg)
+    return jsonify({"status": "ok"})
+
+
+@app.post("/api/tts")
+def tts_synthesize():
+    import edge_tts
+
+    data = request.get_json(force=True)
+    text = data.get("text", "").strip()
+    if not text:
+        return flask_error(400, "text is required")
+    voice = data.get("voice", "ja-JP-NanamiNeural")
+    rate = data.get("rate", "+0%")
+    pitch = data.get("pitch", "+0Hz")
+
+    mp3_path = "/tmp/tts_edge.mp3"
+    try:
+        comm = edge_tts.Communicate(text, voice, rate=rate, pitch=pitch)
+        asyncio.run(comm.save(mp3_path))
+    except Exception as e:
+        return flask_error(502, f"edge-tts failed: {e}")
+
+    if data.get("browser"):
+        with open(mp3_path, "rb") as f:
+            audio_data = f.read()
+        return Response(audio_data, mimetype="audio/mpeg")
+
+    subprocess.Popen(
+        ["mpg123", "-q", mp3_path],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return jsonify({"status": "ok"})
 
 
 # --- Static file serving ---
