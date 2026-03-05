@@ -446,7 +446,7 @@ python3 scripts/kata_local_api.py storage   # ストレージ情報
 bash scripts/deploy_devtools.sh [KATA_IP]
 ```
 
-### タブ一覧（9タブ）
+### タブ一覧（10タブ）
 
 | タブ | 機能 |
 |---|---|
@@ -457,6 +457,7 @@ bash scripts/deploy_devtools.sh [KATA_IP]
 | **Camera** | 写真・顔データ・キャッシュファイルの閲覧・管理（9サブタブ） |
 | **Custom LLM** | カスタムプロンプトで独立LLM呼び出し |
 | **Prompt** | システムプロンプトの編集・バックアップ・復元 |
+| **Sensors** | ハードウェアセンサーのリアルタイム表示（温度・NPU・CPU・メモリ・ADC・タッチ・LED・カメラライブプレビュー・音量変更・WiFi・ストレージ・バッテリー・I2C・LiDAR） |
 | **Events** | BLEイベントログ |
 | **Status** | サービス生存確認 |
 
@@ -466,7 +467,8 @@ bash scripts/deploy_devtools.sh [KATA_IP]
 - 日記イベントの多言語表示（日本語/英語/中文切替）
 - 生成済み日記の永続保存・表示
 - プロンプトのバックアップ/復元機能
-- **OverlayFS 二重書き込み同期** — デバイスは OverlayFS を使用しており、`/app/opt/...`（tmpfs）と `/opt/...`（overlay）は別のファイルシステムである。DevTools はプロンプト保存・復元時に両方のパスに書き込む。起動時に `_init_overlay_dirs()` で全編集対象ファイルを同期し、保存・復元のたびに `_sync_to_overlay()` を実行して、LLMサーバー（`/opt/...` を読む）が常に最新のプロンプトを参照できるようにする。
+- **OverlayFS 二重書き込み同期**
+- **リアルタイムセンサーダッシュボード** — 温度（色グラデーション）、NPU/CPU/メモリのバー表示、ADC電圧、ISP selfpath経由のカメラライブプレビュー、音量スライダー制御 — デバイスは OverlayFS を使用しており、`/app/opt/...`（tmpfs）と `/opt/...`（overlay）は別のファイルシステムである。DevTools はプロンプト保存・復元時に両方のパスに書き込む。起動時に `_init_overlay_dirs()` で全編集対象ファイルを同期し、保存・復元のたびに `_sync_to_overlay()` を実行して、LLMサーバー（`/opt/...` を読む）が常に最新のプロンプトを参照できるようにする。
 
 ## LLMアクションサーバー詳細
 

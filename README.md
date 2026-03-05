@@ -407,7 +407,7 @@ Web-based developer tools running directly on the device (Flask + vanilla JS SPA
 bash scripts/deploy_devtools.sh [KATA_IP]
 ```
 
-### Features (9 Tabs)
+### Features (10 Tabs)
 
 | Tab | Description |
 |---|---|
@@ -418,6 +418,7 @@ bash scripts/deploy_devtools.sh [KATA_IP]
 | **Camera** | Photos, face data, cache files browsing & management (9 sub-tabs) |
 | **Custom LLM** | Independent LLM calls with custom prompt templates |
 | **Prompt** | System prompt editing, backup & restore |
+| **Sensors** | Real-time hardware sensor display (temperature, NPU, CPU, memory, ADC, touch, LED, camera live preview, audio volume control, WiFi, disk, battery, I2C, LiDAR) |
 | **Events** | BLE event log viewer |
 | **Status** | Service health check |
 
@@ -427,7 +428,8 @@ bash scripts/deploy_devtools.sh [KATA_IP]
 - **Multilingual event display** — Japanese/English/Chinese toggle
 - **Persistent generated diary storage & display**
 - **Prompt backup/restore with versioning**
-- **OverlayFS dual-write sync** — The device uses OverlayFS where `/app/opt/...` (tmpfs) and `/opt/...` (overlay) are separate filesystems. DevTools writes to both paths when saving/restoring prompts. `_init_overlay_dirs()` syncs all editable files at startup; `_sync_to_overlay()` runs on every save and restore to ensure LLM servers (which read from `/opt/...`) always see the latest prompts.
+- **OverlayFS dual-write sync**
+- **Real-time sensor dashboard** — Temperature (color-coded), NPU/CPU/memory bars, ADC voltages, camera live preview via ISP selfpath, audio volume slider control — The device uses OverlayFS where `/app/opt/...` (tmpfs) and `/opt/...` (overlay) are separate filesystems. DevTools writes to both paths when saving/restoring prompts. `_init_overlay_dirs()` syncs all editable files at startup; `_sync_to_overlay()` runs on every save and restore to ensure LLM servers (which read from `/opt/...`) always see the latest prompts.
 
 ## LLM Action Server
 
