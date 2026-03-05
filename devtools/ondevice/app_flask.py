@@ -319,7 +319,7 @@ def health_check():
 CAMERA_DIRS = {
     "origin": "/data/cache/video_recorder/result/origin/",
     "hand": "/data/cache/video_recorder/result/hand/",
-    "photos": "/data/cache/image_recorder_archive/",
+    "photos": "/data/cache/photo/",
     "video": "/data/cache/video_recorder/archive/",
     "video_archive": "/data/cache/video_recorder_archive/",
     "sensor": "/data/cache/recorder/archive/",
@@ -407,7 +407,7 @@ def camera_list():
                     "mtime": int(os.path.getmtime(fp)),
                 })
 
-    entries.sort(key=lambda e: e["mtime"], reverse=True)
+    entries.sort(key=lambda e: (e["mtime"], e["name"]), reverse=True)
     total = len(entries)
     return jsonify({
         "files": entries[offset:offset + limit],
@@ -492,7 +492,7 @@ def camera_face_files():
                 "size": os.path.getsize(fp),
                 "mtime": int(os.path.getmtime(fp)),
             })
-    entries.sort(key=lambda e: e["mtime"], reverse=True)
+    entries.sort(key=lambda e: (e["mtime"], e["name"]), reverse=True)
     total = len(entries)
     return jsonify({
         "files": entries[offset:offset + limit],
@@ -529,29 +529,50 @@ def cleanup_empty_faces():
 
 @app.post("/api/camera/delete")
 def camera_delete():
-    """Delete files from a camera directory."""
+    """Delete files or entire face IDs from a camera directory."""
+    import shutil
     data = request.get_json(force=True)
     cat = data.get("type", "")
     files = data.get("files", [])
+    face_ids = data.get("face_ids", [])
 
     dirpath = CAMERA_DIRS.get(cat)
     if not dirpath:
         return flask_error(400, f"unknown type: {cat}")
-    if not files:
-        return flask_error(400, "no files specified")
+    if not files and not face_ids:
+        return flask_error(400, "no files or face_ids specified")
 
     deleted = 0
     errors = []
-    affected_face_ids = set()
     is_face = cat in ("face_known", "face_unknown")
+    affected_face_ids = set()
 
+    # Delete entire face ID directories
+    face_ids_deleted = 0
+    for fid in face_ids:
+        if ".." in fid or "/" in fid or fid.startswith("."):
+            errors.append({"file": fid, "error": "invalid face_id"})
+            continue
+        face_dir = os.path.join(dirpath, fid)
+        real = os.path.realpath(face_dir)
+        if not real.startswith(os.path.realpath(dirpath)):
+            errors.append({"file": fid, "error": "path traversal"})
+            continue
+        if not os.path.isdir(real):
+            errors.append({"file": fid, "error": "not found"})
+            continue
+        try:
+            shutil.rmtree(real)
+            face_ids_deleted += 1
+        except Exception as e:
+            errors.append({"file": fid, "error": str(e)})
+
+    # Delete individual files
     for fname in files:
-        # Path traversal prevention
         if ".." in fname or fname.startswith("/"):
             errors.append({"file": fname, "error": "invalid path"})
             continue
         fp = os.path.join(dirpath, fname)
-        # Ensure resolved path is still under dirpath
         real = os.path.realpath(fp)
         if not real.startswith(os.path.realpath(dirpath)):
             errors.append({"file": fname, "error": "path traversal"})
@@ -562,14 +583,12 @@ def camera_delete():
         try:
             os.remove(real)
             deleted += 1
-            # Track affected face IDs for feature cleanup
             if is_face:
-                face_id = fname.split("/")[0]
-                affected_face_ids.add(face_id)
+                affected_face_ids.add(fname.split("/")[0])
         except Exception as e:
             errors.append({"file": fname, "error": str(e)})
 
-    # Clean up features for affected face IDs
+    # Clean up features for affected face IDs (individual file deletion)
     features_deleted = 0
     for face_id in affected_face_ids:
         feat_dir = os.path.join(dirpath, face_id, "features")
@@ -583,19 +602,22 @@ def camera_delete():
                     features_deleted += 1
                 except Exception:
                     pass
-        # Remove empty features dir
         try:
             os.rmdir(feat_dir)
         except OSError:
             pass
-        # Remove face ID dir if completely empty
         face_dir = os.path.join(dirpath, face_id)
         try:
             _remove_empty_dirs(face_dir)
         except Exception:
             pass
 
-    return jsonify({"deleted": deleted, "features_deleted": features_deleted, "errors": errors})
+    return jsonify({
+        "deleted": deleted,
+        "face_ids_deleted": face_ids_deleted,
+        "features_deleted": features_deleted,
+        "errors": errors,
+    })
 
 
 @app.get("/api/events")

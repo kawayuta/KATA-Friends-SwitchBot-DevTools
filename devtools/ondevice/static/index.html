@@ -415,14 +415,13 @@ const FILE_TYPES = ['video', 'video_archive', 'sensor'];
 
 // --- Selection state ---
 let selectMode = false;
-let selectedFiles = new Set();
-// For face detail, keyed by "faceId/sub"
-let faceSelectedFiles = {};
+let selectedFiles = new Set();       // for photo grid / file list
+let selectedFaceIds = new Set();     // for face card-level selection
 
 function toggleSelectMode() {
   selectMode = !selectMode;
   selectedFiles.clear();
-  faceSelectedFiles = {};
+  selectedFaceIds.clear();
   document.getElementById('cam-select-bar').classList.toggle('hidden', !selectMode);
   document.getElementById('cam-select-toggle').textContent = selectMode ? '選択中' : '選択';
   document.getElementById('cam-select-toggle').className = selectMode
@@ -438,96 +437,92 @@ function toggleSelectMode() {
 }
 
 function updateSelectCount() {
-  const total = getCurrentSelectedCount();
-  document.getElementById('cam-select-count').textContent = `${total}件選択中`;
+  const total = FACE_TYPES.includes(cameraSub) ? selectedFaceIds.size : selectedFiles.size;
+  const label = FACE_TYPES.includes(cameraSub) ? `${total}人選択中` : `${total}件選択中`;
+  document.getElementById('cam-select-count').textContent = label;
   document.getElementById('cam-delete-btn').disabled = total === 0;
-  document.getElementById('cam-select-all').checked = false; // reset
-}
-
-function getCurrentSelectedCount() {
-  if (FACE_TYPES.includes(cameraSub)) {
-    let n = 0;
-    Object.values(faceSelectedFiles).forEach(s => n += s.size);
-    return n;
-  }
-  return selectedFiles.size;
 }
 
 function toggleFileSelect(name) {
   if (selectedFiles.has(name)) selectedFiles.delete(name);
   else selectedFiles.add(name);
   updateSelectCount();
-  // Update visual
-  const el = document.querySelector(`[data-selname="${CSS.escape(name)}"]`);
-  if (el) {
-    el.classList.toggle('checked', selectedFiles.has(name));
-    el.closest('[data-selcard]')?.classList.toggle('card-selected', selectedFiles.has(name));
+  // Update visual for photo grid (.sel-check)
+  const selCheck = document.querySelector(`.sel-check[data-selname="${CSS.escape(name)}"]`);
+  if (selCheck) {
+    selCheck.classList.toggle('checked', selectedFiles.has(name));
+    selCheck.closest('[data-selcard]')?.classList.toggle('card-selected', selectedFiles.has(name));
+    return;
+  }
+  // Update visual for file list (checkbox input)
+  const cb = document.querySelector(`input[data-selname="${CSS.escape(name)}"]`);
+  if (cb) {
+    cb.checked = selectedFiles.has(name);
+    cb.closest('[data-selcard]')?.classList.toggle('card-selected', selectedFiles.has(name));
   }
 }
 
-function toggleFaceFileSelect(faceKey, name) {
-  if (!faceSelectedFiles[faceKey]) faceSelectedFiles[faceKey] = new Set();
-  const s = faceSelectedFiles[faceKey];
-  if (s.has(name)) s.delete(name);
-  else s.add(name);
+function toggleFaceIdSelect(faceId) {
+  if (selectedFaceIds.has(faceId)) selectedFaceIds.delete(faceId);
+  else selectedFaceIds.add(faceId);
   updateSelectCount();
-  const el = document.querySelector(`[data-faceselname="${CSS.escape(faceKey + '/' + name)}"]`);
-  if (el) {
-    el.classList.toggle('checked', s.has(name));
-    el.closest('[data-selcard]')?.classList.toggle('card-selected', s.has(name));
+  // Update visual
+  const cb = document.querySelector(`input[data-faceid="${CSS.escape(faceId)}"]`);
+  if (cb) {
+    cb.checked = selectedFaceIds.has(faceId);
+    cb.closest('[data-facecard]')?.classList.toggle('card-selected', selectedFaceIds.has(faceId));
   }
 }
 
 function toggleSelectAll() {
   const checked = document.getElementById('cam-select-all').checked;
   if (FACE_TYPES.includes(cameraSub)) {
-    // Select/deselect all visible face detail images
-    document.querySelectorAll('[data-faceselname]').forEach(el => {
-      const full = el.dataset.faceselname;
-      const slashIdx = full.indexOf('/');
-      const secondSlash = full.indexOf('/', slashIdx + 1);
-      // faceKey = up to second-to-last slash group, name = rest
-      // Format: faceKey/fileName  where faceKey = "faceId/sub"
-      const parts = full.split('/');
-      const name = parts.pop();
-      const faceKey = parts.join('/');
-      if (!faceSelectedFiles[faceKey]) faceSelectedFiles[faceKey] = new Set();
-      if (checked) faceSelectedFiles[faceKey].add(name);
-      else faceSelectedFiles[faceKey].delete(name);
-      el.classList.toggle('checked', checked);
-      el.closest('[data-selcard]')?.classList.toggle('card-selected', checked);
+    // Select/deselect all face cards
+    document.querySelectorAll('input[data-faceid]').forEach(cb => {
+      const faceId = cb.dataset.faceid;
+      if (checked) selectedFaceIds.add(faceId);
+      else selectedFaceIds.delete(faceId);
+      cb.checked = checked;
+      cb.closest('[data-facecard]')?.classList.toggle('card-selected', checked);
     });
   } else {
-    document.querySelectorAll('[data-selname]').forEach(el => {
+    // Select/deselect all files
+    // Photo grid: .sel-check elements
+    document.querySelectorAll('.sel-check[data-selname]').forEach(el => {
       const name = el.dataset.selname;
       if (checked) selectedFiles.add(name);
       else selectedFiles.delete(name);
       el.classList.toggle('checked', checked);
       el.closest('[data-selcard]')?.classList.toggle('card-selected', checked);
     });
+    // File list: checkbox inputs
+    document.querySelectorAll('input[data-selname]').forEach(cb => {
+      const name = cb.dataset.selname;
+      if (checked) selectedFiles.add(name);
+      else selectedFiles.delete(name);
+      cb.checked = checked;
+      cb.closest('[data-selcard]')?.classList.toggle('card-selected', checked);
+    });
   }
   updateSelectCount();
 }
 
 async function deleteSelected() {
-  let filesToDelete = [];
-  let deleteType = cameraSub;
-
-  if (FACE_TYPES.includes(cameraSub)) {
-    // Collect face files: relative paths like "ID_xxx/recognized_faces/001.jpg"
-    Object.entries(faceSelectedFiles).forEach(([faceKey, names]) => {
-      names.forEach(name => filesToDelete.push(`${faceKey}/${name}`));
-    });
-    deleteType = cameraSub;
-  } else {
-    filesToDelete = [...selectedFiles];
-    deleteType = cameraSub;
-  }
-
-  if (!filesToDelete.length) return;
   const isFace = FACE_TYPES.includes(cameraSub);
-  const extra = isFace ? '\n（関連する特徴データも削除されます）' : '';
-  if (!confirm(`${filesToDelete.length}件のファイルを削除しますか？${extra}`)) return;
+  let body;
+
+  if (isFace) {
+    const ids = [...selectedFaceIds];
+    if (!ids.length) return;
+    const extra = '（登録写真・認識写真・特徴データをすべて削除します）';
+    if (!confirm(`${ids.length}人の顔データを削除しますか？\n${extra}`)) return;
+    body = { type: cameraSub, face_ids: ids, files: [] };
+  } else {
+    const files = [...selectedFiles];
+    if (!files.length) return;
+    if (!confirm(`${files.length}件のファイルを削除しますか？`)) return;
+    body = { type: cameraSub, files };
+  }
 
   const btn = document.getElementById('cam-delete-btn');
   btn.disabled = true;
@@ -536,9 +531,13 @@ async function deleteSelected() {
   try {
     const data = await apiCall('/api/camera/delete', {
       method: 'POST',
-      body: JSON.stringify({ type: deleteType, files: filesToDelete }),
+      body: JSON.stringify(body),
     });
-    const msg = `${data.deleted}件削除しました`;
+    const parts = [];
+    if (data.face_ids_deleted) parts.push(`${data.face_ids_deleted}人の顔データ`);
+    if (data.deleted) parts.push(`${data.deleted}件のファイル`);
+    if (data.features_deleted) parts.push(`${data.features_deleted}件の特徴データ`);
+    const msg = parts.length ? parts.join('・') + 'を削除しました' : '削除完了';
     if (data.errors?.length) {
       alert(`${msg}\nエラー: ${data.errors.map(e => e.file + ': ' + e.error).join('\n')}`);
     }
@@ -632,17 +631,25 @@ async function loadFaceCards() {
     data.ids.forEach(face => {
       const card = document.createElement('div');
       card.className = 'bg-gray-800 rounded p-4 mb-3';
+      if (selectMode) card.dataset.facecard = '1';
+      const isSelected = selectMode && selectedFaceIds.has(face.id);
+      if (isSelected) card.classList.add('card-selected');
 
       // Thumbnail row from enrolled_faces
       const thumbs = face.enrolled.filter(n => /\.(jpe?g|png)$/i.test(n)).slice(0, 4);
       const thumbHtml = thumbs.map(n =>
         `<img src="/api/camera/photo/${cameraSub}/${face.id}/enrolled_faces/${n}" loading="lazy"
               class="w-16 h-16 object-cover rounded cursor-pointer hover:ring-2 hover:ring-kata-500"
-              onclick="openModal('${cameraSub}', {name:'${face.id}/enrolled_faces/${n}', size:0, mtime:0})">`
+              onclick="event.stopPropagation(); openModal('${cameraSub}', {name:'${face.id}/enrolled_faces/${n}', size:0, mtime:0})">`
       ).join('');
 
+      const cbHtml = selectMode
+        ? `<input type="checkbox" ${isSelected ? 'checked' : ''} data-faceid="${face.id}" class="accent-amber-500 w-5 h-5 cursor-pointer flex-shrink-0 mt-1" onclick="event.stopPropagation(); toggleFaceIdSelect('${face.id}')">`
+        : '';
+
       card.innerHTML = `
-        <div class="flex items-start gap-4">
+        <div class="flex items-start gap-3">
+          ${cbHtml}
           <div class="flex gap-2 flex-shrink-0">${thumbHtml || '<div class="w-16 h-16 bg-gray-700 rounded flex items-center justify-center text-2xl">?</div>'}</div>
           <div class="flex-1 min-w-0">
             <div class="font-medium text-sm mb-1">${face.id}</div>
@@ -654,12 +661,19 @@ async function loadFaceCards() {
           </div>
         </div>
         <div id="face-detail-${face.id}" class="mt-3 hidden"></div>
-        <div class="mt-2 flex gap-2">
+        <div class="mt-2 flex gap-2 ${selectMode ? 'ml-8' : ''}">
           <button onclick="toggleFaceDetail('${kind}','${face.id}','recognized_faces')"
                   class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded transition">認識写真を表示</button>
           <button onclick="toggleFaceDetail('${kind}','${face.id}','enrolled_faces')"
                   class="text-xs bg-gray-700 hover:bg-gray-600 px-2 py-1 rounded transition">登録写真</button>
         </div>`;
+      if (selectMode) {
+        card.style.cursor = 'pointer';
+        card.onclick = (e) => {
+          if (e.target.tagName === 'INPUT' || e.target.tagName === 'IMG' || e.target.tagName === 'BUTTON') return;
+          toggleFaceIdSelect(face.id);
+        };
+      }
       filelist.appendChild(card);
     });
   } catch (e) {
@@ -712,28 +726,13 @@ async function loadFaceDetailPage(kind, faceId, sub, offset, append) {
         gridDiv.className = 'face-detail-grid grid grid-cols-4 sm:grid-cols-6 gap-2';
         container.appendChild(gridDiv);
       }
-      const faceKey = `${faceId}/${sub}`;
       imgFiles.forEach(f => {
-        const wrapper = document.createElement('div');
-        wrapper.className = 'relative';
-        if (selectMode) wrapper.dataset.selcard = '1';
-        const faceSelKey = `${faceKey}/${f.name}`;
-        const isSelected = selectMode && faceSelectedFiles[faceKey]?.has(f.name);
-        if (isSelected) wrapper.classList.add('card-selected');
-        const checkHtml = selectMode
-          ? `<div class="sel-check ${isSelected ? 'checked' : ''}" data-faceselname="${faceSelKey}">✓</div>`
-          : '';
         const img = document.createElement('img');
         img.src = `/api/camera/photo/${catKey}/${faceId}/${sub}/${f.name}`;
         img.loading = 'lazy';
         img.className = 'w-full h-20 object-cover rounded cursor-pointer hover:ring-2 hover:ring-kata-500';
-        img.onclick = () => {
-          if (selectMode) { toggleFaceFileSelect(faceKey, f.name); return; }
-          openModal(catKey, {name: `${faceId}/${sub}/${f.name}`, size: f.size, mtime: f.mtime});
-        };
-        wrapper.innerHTML = checkHtml;
-        wrapper.appendChild(img);
-        gridDiv.appendChild(wrapper);
+        img.onclick = () => openModal(catKey, {name: `${faceId}/${sub}/${f.name}`, size: f.size, mtime: f.mtime});
+        gridDiv.appendChild(img);
       });
     }
 
