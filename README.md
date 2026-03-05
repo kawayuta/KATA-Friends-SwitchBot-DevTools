@@ -260,6 +260,70 @@ Frame 2: msgpack(json_payload_string)
 
 ## How to Trigger Actions
 
+### Flow: Voice Command → Action Execution
+
+```mermaid
+flowchart LR
+    A["🎤 Voice Input"] --> B[pet_voice\nSenseVoice ASR]
+    B --> C[Text]
+    C --> D["LLM Action Server\n:8080 Qwen3+LoRA"]
+    D --> E["mood/instruction\ne.g. happy/dance"]
+    E --> F[ZMQ Publish\n/ai/do_action]
+    F --> G[master process\nXPUB/XSUB proxy]
+    G --> H[control_center\naction executor]
+    H --> I["🤖 Motor/Eyes/Sound"]
+```
+
+### Flow: External Control (from Mac)
+
+```mermaid
+flowchart TB
+    subgraph Mac
+        M1["curl / script"]
+        M2[ble_watcher.py]
+        M3[kata_local_api.py]
+    end
+
+    subgraph Device["Kata Friends (192.168.x.x)"]
+        subgraph LLM["LLM Servers (no auth)"]
+            L1[":8080 Action"]
+            L2[":8082 Diary"]
+            L3[":8083 Router"]
+        end
+        subgraph ZMQ["ZMQ IPC (localhost only)"]
+            Z1[":5558 XPUB"]
+            Z2[":5559 XSUB"]
+        end
+        subgraph API["Local API (auth required)"]
+            A1[":27999 thing_model"]
+        end
+        ADB[":5555 ADB\nroot shell"]
+    end
+
+    M1 -->|"POST /rkllm_action\n(no auth)"| L1
+    M1 -->|"POST /rkllm_diary\n(no auth)"| L2
+    M3 -->|"POST + MD5 auth"| A1
+    M2 -.->|"BLE passive scan"| Device
+    M1 -->|"adb shell"| ADB
+    ADB -->|"ZMQ client"| Z2
+
+    L3 --> L1
+    L3 --> L2
+```
+
+### Flow: Diary Generation
+
+```mermaid
+flowchart LR
+    A[Daily events log] --> B["POST :8082/rkllm_diary\ntask: diary"]
+    B --> C["Qwen3-1.7B\non NPU"]
+    C --> D["Title / Body / Emotion\n(Pixar-style narrative)"]
+    D --> E{Language?}
+    E -->|Chinese| F[Done]
+    E -->|Other| G[Translation\nprompt]
+    G --> F
+```
+
 There are 3 ways to make Kata Friends perform actions:
 
 ### Method 1: LLM Action Server (Easiest)

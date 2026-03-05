@@ -151,8 +151,18 @@ async def proxy_local(req: LocalAPIRequest):
             raise HTTPException(502, str(e))
 
 
+_adb_connected = False
+
 async def adb_shell(cmd: str, timeout: float = 10.0) -> str:
     """ADB経由でデバイス上のコマンドを実行"""
+    global _adb_connected
+    if not _adb_connected:
+        p = await asyncio.create_subprocess_exec(
+            "adb", "connect", f"{KATA_IP}:5555",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        await p.communicate()
+        _adb_connected = True
     proc = await asyncio.create_subprocess_exec(
         "adb", "-s", f"{KATA_IP}:5555", "shell", cmd,
         stdout=asyncio.subprocess.PIPE,

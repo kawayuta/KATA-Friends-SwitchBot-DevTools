@@ -304,6 +304,70 @@ adb shell
 
 ## アクションの実行方法
 
+### フロー: 音声コマンド → アクション実行
+
+```mermaid
+flowchart LR
+    A["🎤 音声入力"] --> B[pet_voice\nSenseVoice ASR]
+    B --> C[テキスト]
+    C --> D["LLMアクションサーバー\n:8080 Qwen3+LoRA"]
+    D --> E["mood/instruction\n例: happy/dance"]
+    E --> F[ZMQパブリッシュ\n/ai/do_action]
+    F --> G[masterプロセス\nXPUB/XSUBプロキシ]
+    G --> H[control_center\nアクション実行]
+    H --> I["🤖 モーター/目/音声"]
+```
+
+### フロー: 外部からの制御（Mac側）
+
+```mermaid
+flowchart TB
+    subgraph Mac
+        M1["curl / スクリプト"]
+        M2[ble_watcher.py]
+        M3[kata_local_api.py]
+    end
+
+    subgraph Device["Kata Friends (192.168.x.x)"]
+        subgraph LLM["LLMサーバー群 (認証不要)"]
+            L1[":8080 アクション"]
+            L2[":8082 日記"]
+            L3[":8083 ルーター"]
+        end
+        subgraph ZMQ["ZMQ IPC (localhost限定)"]
+            Z1[":5558 XPUB"]
+            Z2[":5559 XSUB"]
+        end
+        subgraph API["ローカルAPI (認証必要)"]
+            A1[":27999 thing_model"]
+        end
+        ADB[":5555 ADB\nrootシェル"]
+    end
+
+    M1 -->|"POST /rkllm_action\n(認証不要)"| L1
+    M1 -->|"POST /rkllm_diary\n(認証不要)"| L2
+    M3 -->|"POST + MD5認証"| A1
+    M2 -.->|"BLEパッシブスキャン"| Device
+    M1 -->|"adb shell"| ADB
+    ADB -->|"ZMQクライアント"| Z2
+
+    L3 --> L1
+    L3 --> L2
+```
+
+### フロー: 日記生成
+
+```mermaid
+flowchart LR
+    A[1日のイベントログ] --> B["POST :8082/rkllm_diary\ntask: diary"]
+    B --> C["Qwen3-1.7B\nNPU上で実行"]
+    C --> D["タイトル / 本文 / 感情\n(Pixar童話風)"]
+    D --> E{言語?}
+    E -->|中国語| F[完了]
+    E -->|その他| G[翻訳\nプロンプト]
+    G --> F
+```
+
 Kata Friendsにアクションを実行させる方法は3つある:
 
 ### 方法1: LLMアクションサーバー（最も簡単）

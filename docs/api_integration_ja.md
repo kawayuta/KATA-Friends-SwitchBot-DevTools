@@ -191,6 +191,18 @@ SwitchBot標準サービス `cba20d00-224d-11e6-9fb8-0002a5d5c51b` を持つ。W
 
 ## アクションの実行方法
 
+### アクション実行フロー
+
+```mermaid
+flowchart LR
+    A["🎤 音声 / curl"] --> B["LLM :8080\nQwen3+LoRA"]
+    B --> C["mood/instruction"]
+    C --> D[ZMQ\n/ai/do_action]
+    D --> E[master\nXPUB/XSUB]
+    E --> F[control_center]
+    F --> G["🤖 実行"]
+```
+
 ### LLMサーバー経由（認証不要）
 
 ```bash
@@ -255,15 +267,38 @@ adb shell
 
 ## アーキテクチャ
 
-```
-┌──────────────┐  BLE Advertisement  ┌──────────────┐  HTTP POST  ┌──────────────┐
-│ Kata Friends │ ──────────────────→ │ ble_watcher  │ ──────────→ │  home_api    │
-│  (WoAIPE)    │  byte[12],[13]変化   │  (Mac上)     │  /events    │  (FastAPI)   │
-└──────────────┘                     └──────────────┘             └──────────────┘
-       ↑ ADB (port 5555)                    │
-       ↑ Local API (port 27999)             │
-       └────────────────────────────────────┘
-        写真・顔認識データ取得 (kata_local_api.py)
+```mermaid
+flowchart TB
+    subgraph Mac["Mac (制御側)"]
+        BLE[ble_watcher.py\nBLE監視]
+        API[home_api\nFastAPI :9000]
+        CLI[kata_local_api.py]
+        CURL[curl / スクリプト]
+    end
+
+    subgraph Device["Kata Friends"]
+        subgraph Internal["内部サービス"]
+            VOICE[pet_voice\n音声認識]
+            LLM[LLM :8080\nアクション]
+            DIARY[LLM :8082\n日記]
+            ZMQ[ZMQ IPC\n:5558/:5559]
+            CC[control_center\n:27999]
+            MASTER[master\nプロセス]
+        end
+        MOTOR["🤖 モーター/目/音声"]
+    end
+
+    BLE -.->|"BLEスキャン\nbyte[12],[13]"| Device
+    BLE -->|"POST /events"| API
+    CLI -->|"POST + MD5認証"| CC
+    CURL -->|"POST (認証不要)"| LLM
+    CURL -->|"adb shell"| Device
+
+    VOICE --> LLM
+    LLM --> ZMQ
+    ZMQ --> MASTER
+    MASTER --> MOTOR
+    CC --> ZMQ
 ```
 
 詳細は **[デバイス内部構造ドキュメント](../README_ja.md)** を参照。

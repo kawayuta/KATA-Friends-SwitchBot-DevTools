@@ -190,6 +190,18 @@ Only `0x57` prefix responds (`0x56`, `0x58`, `0x01`, etc. yield nothing). Full 0
 
 ## How to Trigger Actions
 
+### Action Execution Flow
+
+```mermaid
+flowchart LR
+    A["🎤 Voice / curl"] --> B["LLM :8080\nQwen3+LoRA"]
+    B --> C["mood/instruction"]
+    C --> D[ZMQ\n/ai/do_action]
+    D --> E[master\nXPUB/XSUB]
+    E --> F[control_center]
+    F --> G["🤖 Execute"]
+```
+
 ### Via LLM Server (No Auth Required)
 
 ```bash
@@ -254,15 +266,38 @@ adb shell
 
 ## Architecture
 
-```
-┌──────────────┐  BLE Advertisement  ┌──────────────┐  HTTP POST  ┌──────────────┐
-│ Kata Friends │ ──────────────────→ │ ble_watcher  │ ──────────→ │  home_api    │
-│  (WoAIPE)    │  byte[12],[13]      │  (on Mac)    │  /events    │  (FastAPI)   │
-└──────────────┘                     └──────────────┘             └──────────────┘
-       ↑ ADB (port 5555)                    │
-       ↑ Local API (port 27999)             │
-       └────────────────────────────────────┘
-        Photos & face recognition (kata_local_api.py)
+```mermaid
+flowchart TB
+    subgraph Mac["Mac (Control)"]
+        BLE[ble_watcher.py\nBLE monitor]
+        API[home_api\nFastAPI :9000]
+        CLI[kata_local_api.py]
+        CURL[curl / scripts]
+    end
+
+    subgraph Device["Kata Friends"]
+        subgraph Internal["Internal Services"]
+            VOICE[pet_voice\nASR]
+            LLM[LLM :8080\nAction]
+            DIARY[LLM :8082\nDiary]
+            ZMQ[ZMQ IPC\n:5558/:5559]
+            CC[control_center\n:27999]
+            MASTER[master\nprocess]
+        end
+        MOTOR["🤖 Motors/Eyes/Sound"]
+    end
+
+    BLE -.->|"BLE scan\nbyte[12],[13]"| Device
+    BLE -->|"POST /events"| API
+    CLI -->|"POST + MD5 auth"| CC
+    CURL -->|"POST (no auth)"| LLM
+    CURL -->|"adb shell"| Device
+
+    VOICE --> LLM
+    LLM --> ZMQ
+    ZMQ --> MASTER
+    MASTER --> MOTOR
+    CC --> ZMQ
 ```
 
 See **[Device Internals Documentation](../README.md)** for full details.

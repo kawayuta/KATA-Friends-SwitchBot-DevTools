@@ -41,11 +41,13 @@ scripts/
 /data/devtools/
 ├── app_flask.py
 ├── zmq_publish.py
+├── start.sh          # 起動ラッパースクリプト
 └── static/
     └── index.html
 ```
 
 systemd サービスファイル: `/data/overlay_upper/etc/systemd/system/kata-devtools.service`
+overlay 永続化フラグ: `/overlay/overlay_upper` (このファイルが存在しないと起動時に overlay_upper が全削除される)
 
 ## 起動方法
 
@@ -59,6 +61,7 @@ bash scripts/deploy_devtools.sh [KATA_IP]
 ```
 
 デバイス再起動後も systemd により自動起動する。
+初回デプロイ時は overlayfs への反映のため **reboot が1回必要**。
 
 **前提条件:**
 - ADB接続済み (`adb connect <KATA_IP>:5555`)
@@ -80,8 +83,13 @@ docker compose up --build
 **前提条件:**
 - `.env` に `KATA_IP`, `KATA_LOCAL_PORT`, `KATA_DEVICE_ID`, `KATA_LOCAL_TOKEN` が設定済み
 - デバイスと同一ネットワーク上にいること
-- ADB接続済み (`adb connect <KATA_IP>:5555`)
 - デバイス上に `/data/pylib/zmq_publish.py` が配置済み (ZMQ機能使用時)
+
+**Docker版の注意点:**
+- Dockerfile に `android-tools-adb` をインストール済み
+- ADB接続はアプリ側で初回リクエスト時に自動実行 (`adb connect` 不要)
+- macOS では `network_mode: host` が動作しないため、ポートマッピング (`ports: 9001:9001`) を使用
+- コンテナ内からデバイスIPへの TCP 接続でADB通信する
 
 ### C. Mac開発版 (ローカル)
 
@@ -128,13 +136,20 @@ After=network.target master.service
 Type=simple
 User=wlab
 WorkingDirectory=/data/devtools
-ExecStart=/usr/bin/python3 /data/devtools/app_flask.py
+ExecStart=/data/devtools/start.sh
 Restart=always
 RestartSec=3
 Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
+```
+
+`start.sh` の中身:
+```bash
+#!/bin/bash
+cd /data/devtools
+exec python3 app_flask.py
 ```
 
 **管理コマンド (ADB shell内):**
@@ -153,10 +168,28 @@ bash scripts/deploy_devtools.sh [KATA_IP]
 
 **処理内容:**
 1. ADB 接続確認
-2. `/data/devtools/` ディレクトリ作成
-3. `devtools/ondevice/` の全ファイルを push
-4. systemd サービスファイルを `/data/overlay_upper/etc/systemd/system/` に push
-5. `systemctl daemon-reload && systemctl enable --now kata-devtools`
+2. `/data/devtools/` ディレクトリ作成 + ファイル push
+3. `/overlay/overlay_upper` フラグファイル作成 (overlay 永続化)
+4. systemd サービスファイルを `/data/overlay_upper/etc/systemd/system/` に配置
+5. `multi-user.target.wants` にシンボリックリンクで自動起動有効化
+6. `systemctl enable --now` で即時起動 (初回は要 reboot)
+
+### overlayfs 永続化の仕組み
+
+デバイスの rootfs は overlayfs で構成されている:
+- **lowerdir**: `/app:/` (読み取り専用のベースイメージ)
+- **upperdir**: `/data/overlay_upper/` (変更レイヤー)
+
+`/sbin/init` が起動時に以下の分岐を行う:
+
+| `/overlay/overlay_upper` ファイル | 動作 |
+|---|---|
+| **存在する** | overlay を **rw** マウント、upper の内容を保持 |
+| **存在しない** | `overlay_upper/*` を**全削除**、overlay を **ro** マウント |
+
+デプロイスクリプトは `touch /overlay/overlay_upper` でフラグを作成し、overlay upper への変更が再起動後も維持されるようにする。
+
+> **注意:** overlay upper に新しいファイルを追加した場合、overlayfs の仕様上 **reboot が必要** (マウント後に upper に追加されたファイルはマージビューに即時反映されない)。
 
 ## API エンドポイント一覧
 
@@ -572,14 +605,31 @@ BLE イベントログの表示。
 
 ---
 
+## セキュリティ
+
+### 認証情報の管理
+
+- 実際のトークン・シークレットは `.env` に格納 (`.gitignore` 済み、リポジトリに含まれない)
+- `.env.example` にはプレースホルダーのみ記載
+- ローカルAPI認証方式 (`MD5(body + token)`) はコード内に公開しているが、トークン自体はデバイスごとにMQTT経由で動的に発行されるUUIDのため、アルゴリズム公開による影響なし
+
+### アクセス範囲
+
+| 接続方法 | 認証 | 備考 |
+|---|---|---|
+| ADB (:5555) | なし | LAN内のみ |
+| LLM (:8080, :8082) | なし | LAN内のみ |
+| ZMQ (:5558) | なし | LAN内のみ |
+| ローカルAPI (:27999) | `MD5(body + token)` | トークンはデバイスごとに動的生成 |
+
 ## 環境変数 (.env)
 
 | 変数名 | 説明 | 例 |
 |---|---|---|
 | `KATA_IP` | デバイスの IP アドレス | `192.168.11.17` |
 | `KATA_LOCAL_PORT` | ローカル API ポート | `27999` |
-| `KATA_DEVICE_ID` | デバイス ID | `B0E9FEFE04F7` |
-| `KATA_LOCAL_TOKEN` | MD5 認証トークン (UUID) | `c86a281f-...` |
+| `KATA_DEVICE_ID` | デバイス ID | (MACアドレス由来の hex 文字列) |
+| `KATA_LOCAL_TOKEN` | MD5 認証トークン (UUID) | (MQTT経由で動的取得) |
 
 ---
 
