@@ -314,6 +314,290 @@ def health_check():
     return jsonify({"ip": "127.0.0.1 (on-device)", "services": results})
 
 
+# --- Camera / Media ---
+
+CAMERA_DIRS = {
+    "origin": "/data/cache/video_recorder/result/origin/",
+    "hand": "/data/cache/video_recorder/result/hand/",
+    "photos": "/data/cache/image_recorder_archive/",
+    "video": "/data/cache/video_recorder/archive/",
+    "video_archive": "/data/cache/video_recorder_archive/",
+    "sensor": "/data/cache/recorder/archive/",
+    "face_known": "/data/ai_brain_data/face_metadata/known/",
+    "face_unknown": "/data/ai_brain_data/face_metadata/unknown/",
+}
+
+
+RECURSIVE_DIRS = {"face_known", "face_unknown"}
+
+
+def _remove_empty_dirs(path):
+    """Remove a directory tree bottom-up if all subdirs are empty."""
+    if not os.path.isdir(path):
+        return
+    for entry in os.listdir(path):
+        sub = os.path.join(path, entry)
+        if os.path.isdir(sub):
+            _remove_empty_dirs(sub)
+    # Try removing if now empty
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
+
+
+def _dir_stats(path, recursive=False):
+    """Return (count, total_size) for files in a directory."""
+    if not os.path.isdir(path):
+        return 0, 0
+    count = 0
+    total = 0
+    if recursive:
+        for root, _dirs, files in os.walk(path):
+            for name in files:
+                fp = os.path.join(root, name)
+                count += 1
+                total += os.path.getsize(fp)
+    else:
+        for name in os.listdir(path):
+            fp = os.path.join(path, name)
+            if os.path.isfile(fp):
+                count += 1
+                total += os.path.getsize(fp)
+    return count, total
+
+
+@app.get("/api/camera/summary")
+def camera_summary():
+    result = {}
+    for key, path in CAMERA_DIRS.items():
+        count, total_size = _dir_stats(path, recursive=(key in RECURSIVE_DIRS))
+        result[key] = {"count": count, "total_size": total_size}
+    return jsonify(result)
+
+
+@app.get("/api/camera/list")
+def camera_list():
+    cat = request.args.get("type", "origin")
+    offset = request.args.get("offset", 0, type=int)
+    limit = request.args.get("limit", 20, type=int)
+
+    dirpath = CAMERA_DIRS.get(cat)
+    if not dirpath or not os.path.isdir(dirpath):
+        return jsonify({"files": [], "total": 0, "offset": offset, "limit": limit})
+
+    entries = []
+    if cat in RECURSIVE_DIRS:
+        for root, _dirs, files in os.walk(dirpath):
+            for name in files:
+                fp = os.path.join(root, name)
+                relpath = os.path.relpath(fp, dirpath)
+                entries.append({
+                    "name": relpath,
+                    "size": os.path.getsize(fp),
+                    "mtime": int(os.path.getmtime(fp)),
+                })
+    else:
+        for name in os.listdir(dirpath):
+            fp = os.path.join(dirpath, name)
+            if os.path.isfile(fp):
+                entries.append({
+                    "name": name,
+                    "size": os.path.getsize(fp),
+                    "mtime": int(os.path.getmtime(fp)),
+                })
+
+    entries.sort(key=lambda e: e["mtime"], reverse=True)
+    total = len(entries)
+    return jsonify({
+        "files": entries[offset:offset + limit],
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    })
+
+
+@app.get("/api/camera/photo/<cat>/<path:filename>")
+def camera_photo(cat, filename):
+    dirpath = CAMERA_DIRS.get(cat)
+    if not dirpath:
+        abort(404)
+    # Prevent path traversal
+    if ".." in filename or filename.startswith("/"):
+        abort(400)
+    return send_from_directory(dirpath, filename)
+
+
+@app.get("/api/camera/faces")
+def camera_faces():
+    """List face IDs with per-subfolder counts and thumbnail."""
+    kind = request.args.get("kind", "known")  # known or unknown
+    dirpath = CAMERA_DIRS.get(f"face_{kind}")
+    if not dirpath or not os.path.isdir(dirpath):
+        return jsonify({"ids": []})
+
+    include_empty = request.args.get("include_empty", "0") == "1"
+    ids = []
+    empty_count = 0
+    for entry in sorted(os.listdir(dirpath), reverse=True):
+        id_path = os.path.join(dirpath, entry)
+        if not os.path.isdir(id_path):
+            continue
+        info = {"id": entry, "enrolled": [], "recognized_count": 0, "features_count": 0}
+        # enrolled_faces
+        ef_path = os.path.join(id_path, "enrolled_faces")
+        if os.path.isdir(ef_path):
+            info["enrolled"] = sorted(os.listdir(ef_path))[:5]  # max 5 thumbnails
+        # recognized_faces
+        rf_path = os.path.join(id_path, "recognized_faces")
+        if os.path.isdir(rf_path):
+            info["recognized_count"] = len(os.listdir(rf_path))
+        # features
+        ft_path = os.path.join(id_path, "features")
+        if os.path.isdir(ft_path):
+            info["features_count"] = len(os.listdir(ft_path))
+        total_files = len(info["enrolled"]) + info["recognized_count"] + info["features_count"]
+        if total_files == 0:
+            empty_count += 1
+            if not include_empty:
+                continue
+        ids.append(info)
+    return jsonify({"ids": ids, "empty_count": empty_count})
+
+
+@app.get("/api/camera/face_files")
+def camera_face_files():
+    """List files in a specific face ID subfolder."""
+    kind = request.args.get("kind", "known")
+    face_id = request.args.get("id", "")
+    subfolder = request.args.get("sub", "recognized_faces")
+    offset = request.args.get("offset", 0, type=int)
+    limit = request.args.get("limit", 20, type=int)
+
+    if not face_id or ".." in face_id or ".." in subfolder:
+        abort(400)
+    if subfolder not in ("enrolled_faces", "recognized_faces", "features"):
+        abort(400)
+
+    dirpath = os.path.join(CAMERA_DIRS.get(f"face_{kind}", ""), face_id, subfolder)
+    if not os.path.isdir(dirpath):
+        return jsonify({"files": [], "total": 0})
+
+    entries = []
+    for name in os.listdir(dirpath):
+        fp = os.path.join(dirpath, name)
+        if os.path.isfile(fp):
+            entries.append({
+                "name": name,
+                "size": os.path.getsize(fp),
+                "mtime": int(os.path.getmtime(fp)),
+            })
+    entries.sort(key=lambda e: e["mtime"], reverse=True)
+    total = len(entries)
+    return jsonify({
+        "files": entries[offset:offset + limit],
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+    })
+
+
+@app.post("/api/camera/cleanup_empty_faces")
+def cleanup_empty_faces():
+    """Remove face ID directories that have no files."""
+    import shutil
+    kind = request.args.get("kind", "known")
+    dirpath = CAMERA_DIRS.get(f"face_{kind}")
+    if not dirpath or not os.path.isdir(dirpath):
+        return jsonify({"removed": 0})
+    removed = 0
+    for entry in os.listdir(dirpath):
+        id_path = os.path.join(dirpath, entry)
+        if not os.path.isdir(id_path):
+            continue
+        # Check if any files exist recursively
+        has_files = False
+        for _root, _dirs, files in os.walk(id_path):
+            if files:
+                has_files = True
+                break
+        if not has_files:
+            shutil.rmtree(id_path, ignore_errors=True)
+            removed += 1
+    return jsonify({"removed": removed})
+
+
+@app.post("/api/camera/delete")
+def camera_delete():
+    """Delete files from a camera directory."""
+    data = request.get_json(force=True)
+    cat = data.get("type", "")
+    files = data.get("files", [])
+
+    dirpath = CAMERA_DIRS.get(cat)
+    if not dirpath:
+        return flask_error(400, f"unknown type: {cat}")
+    if not files:
+        return flask_error(400, "no files specified")
+
+    deleted = 0
+    errors = []
+    affected_face_ids = set()
+    is_face = cat in ("face_known", "face_unknown")
+
+    for fname in files:
+        # Path traversal prevention
+        if ".." in fname or fname.startswith("/"):
+            errors.append({"file": fname, "error": "invalid path"})
+            continue
+        fp = os.path.join(dirpath, fname)
+        # Ensure resolved path is still under dirpath
+        real = os.path.realpath(fp)
+        if not real.startswith(os.path.realpath(dirpath)):
+            errors.append({"file": fname, "error": "path traversal"})
+            continue
+        if not os.path.isfile(real):
+            errors.append({"file": fname, "error": "not found"})
+            continue
+        try:
+            os.remove(real)
+            deleted += 1
+            # Track affected face IDs for feature cleanup
+            if is_face:
+                face_id = fname.split("/")[0]
+                affected_face_ids.add(face_id)
+        except Exception as e:
+            errors.append({"file": fname, "error": str(e)})
+
+    # Clean up features for affected face IDs
+    features_deleted = 0
+    for face_id in affected_face_ids:
+        feat_dir = os.path.join(dirpath, face_id, "features")
+        if not os.path.isdir(feat_dir):
+            continue
+        for name in os.listdir(feat_dir):
+            fp = os.path.join(feat_dir, name)
+            if os.path.isfile(fp):
+                try:
+                    os.remove(fp)
+                    features_deleted += 1
+                except Exception:
+                    pass
+        # Remove empty features dir
+        try:
+            os.rmdir(feat_dir)
+        except OSError:
+            pass
+        # Remove face ID dir if completely empty
+        face_dir = os.path.join(dirpath, face_id)
+        try:
+            _remove_empty_dirs(face_dir)
+        except Exception:
+            pass
+
+    return jsonify({"deleted": deleted, "features_deleted": features_deleted, "errors": errors})
+
+
 @app.get("/api/events")
 def get_events():
     """Return recent events from log file."""
