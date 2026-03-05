@@ -578,9 +578,34 @@ def _read_cameras():
     return cameras
 
 
+def _read_amixer_control(name):
+    """Read a single amixer control, return (value, min, max, percent) or None."""
+    try:
+        out = subprocess.check_output(
+            ["amixer", "get", name], timeout=3, stderr=subprocess.DEVNULL
+        ).decode(errors="ignore")
+        # Try percentage first
+        m_pct = re.search(r'\[(\d+)%\]', out)
+        if m_pct:
+            return {"value": int(m_pct.group(1)), "percent": int(m_pct.group(1))}
+        # Try raw integer value with limits
+        m_val = re.search(r':\s*values=(\d+)', out)
+        m_range = re.search(r'min=(\d+),max=(\d+)', out)
+        if m_val and m_range:
+            val = int(m_val.group(1))
+            vmin, vmax = int(m_range.group(1)), int(m_range.group(2))
+            pct = round((val - vmin) / (vmax - vmin) * 100) if vmax > vmin else 0
+            return {"value": val, "min": vmin, "max": vmax, "percent": pct}
+        if m_val:
+            return {"value": int(m_val.group(1))}
+    except Exception:
+        pass
+    return None
+
+
 def _read_audio():
     """Read audio/speaker info from ALSA."""
-    info = {"cards": [], "volume": None}
+    info = {"cards": [], "volume": None, "mic": {}}
     # Sound cards
     cards_str = _read_file("/proc/asound/cards")
     if cards_str:
@@ -590,7 +615,7 @@ def _read_audio():
                 "name": m.group(2),
                 "description": m.group(3).strip(),
             })
-    # Volume via amixer (best-effort)
+    # Master volume
     try:
         out = subprocess.check_output(
             ["amixer", "get", "Master"], timeout=3, stderr=subprocess.DEVNULL
@@ -603,6 +628,26 @@ def _read_audio():
             info["mute"] = m2.group(1) == "off"
     except Exception:
         pass
+    # Microphone controls
+    mic = {}
+    for name in ("ADCL Capture", "ADCR Capture", "ADCL PGA", "ADCR PGA",
+                 "Main Mic", "Headset Mic"):
+        ctrl = _read_amixer_control(name)
+        if ctrl is not None:
+            mic[name] = ctrl
+    # Switches (on/off)
+    for name in ("Main Mic", "Headset Mic"):
+        try:
+            out = subprocess.check_output(
+                ["amixer", "get", name], timeout=3, stderr=subprocess.DEVNULL
+            ).decode(errors="ignore")
+            m = re.search(r'\[(on|off)\]', out)
+            if m:
+                mic.setdefault(name, {})["switch"] = m.group(1) == "on"
+        except Exception:
+            pass
+    if mic:
+        info["mic"] = mic
     return info
 
 
@@ -760,6 +805,38 @@ def set_volume():
             timeout=5, stderr=subprocess.DEVNULL,
         )
         return jsonify({"status": "ok", "volume": volume})
+    except Exception as e:
+        return flask_error(502, f"amixer failed: {e}")
+
+
+@app.post("/api/sensors/mic")
+def set_mic():
+    """Set microphone gain via amixer."""
+    data = request.get_json(force=True)
+    control = data.get("control")
+    value = data.get("value")
+    if not control or value is None:
+        return flask_error(400, "control and value are required")
+    allowed = {"ADCL Capture", "ADCR Capture", "ADCL PGA", "ADCR PGA",
+               "Main Mic", "Headset Mic"}
+    if control not in allowed:
+        return flask_error(400, f"unknown control: {control}")
+    value = int(value)
+    try:
+        # For switch controls (Main Mic, Headset Mic), treat as on/off toggle
+        if control in ("Main Mic", "Headset Mic"):
+            state = "on" if value else "off"
+            subprocess.check_output(
+                ["amixer", "set", control, state],
+                timeout=5, stderr=subprocess.DEVNULL,
+            )
+            return jsonify({"status": "ok", "control": control, "switch": state})
+        # For gain controls, set raw value
+        subprocess.check_output(
+            ["amixer", "set", control, str(value)],
+            timeout=5, stderr=subprocess.DEVNULL,
+        )
+        return jsonify({"status": "ok", "control": control, "value": value})
     except Exception as e:
         return flask_error(502, f"amixer failed: {e}")
 

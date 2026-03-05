@@ -333,6 +333,12 @@
             <span id="volume-val" class="text-sm w-12 text-right font-mono">0%</span>
             <span id="audio-mute-badge" class="text-xs text-red-400 hidden">MUTE</span>
           </div>
+          <div id="audio-mic-section" class="hidden">
+            <div class="border-t border-gray-700 mt-3 pt-3">
+              <span class="text-sm text-gray-400 font-semibold">マイク</span>
+              <div id="mic-controls" class="mt-2 space-y-2"></div>
+            </div>
+          </div>
           <div id="audio-cards"></div>
         </div>
       </div>
@@ -1589,6 +1595,46 @@ async function loadSensors() {
             `<div class="text-sm text-gray-400"><span class="font-mono text-gray-500">[${c.id}]</span> ${c.name} — ${c.description}</div>`
           ).join('');
         }
+        // Mic controls
+        const micSection = document.getElementById('audio-mic-section');
+        const micData = d.audio.mic;
+        if (micData && Object.keys(micData).length && micSection) {
+          micSection.classList.remove('hidden');
+          const micEl = document.getElementById('mic-controls');
+          if (micEl) {
+            const gainControls = ["ADCL Capture", "ADCR Capture", "ADCL PGA", "ADCR PGA"];
+            const switchControls = ["Main Mic", "Headset Mic"];
+            let micHtml = '';
+            gainControls.forEach(name => {
+              const c = micData[name];
+              if (!c) return;
+              const pct = c.percent ?? 0;
+              const label = name.replace('ADCL ', 'L-').replace('ADCR ', 'R-');
+              micHtml += `<div class="flex items-center gap-3">
+                <span class="text-sm text-gray-400 w-24">${label}</span>
+                <input type="range" min="${c.min ?? 0}" max="${c.max ?? 100}" value="${c.value}"
+                  class="flex-1 h-2 rounded-lg appearance-none cursor-pointer accent-green-500 bg-gray-600"
+                  oninput="this.nextElementSibling.textContent=this.value"
+                  onchange="setMicGain('${name}', parseInt(this.value))">
+                <span class="text-sm w-10 text-right font-mono text-gray-300">${c.value}</span>
+                <span class="text-xs text-gray-500 w-10">${pct}%</span>
+              </div>`;
+            });
+            switchControls.forEach(name => {
+              const c = micData[name];
+              if (!c) return;
+              const isOn = c.switch === true;
+              micHtml += `<div class="flex items-center gap-3">
+                <span class="text-sm text-gray-400 w-24">${name}</span>
+                <button onclick="toggleMicSwitch('${name}', ${isOn ? 0 : 1})"
+                  class="px-3 py-1 rounded text-xs font-medium ${isOn ? 'bg-green-600 text-white' : 'bg-gray-600 text-gray-400'}">
+                  ${isOn ? 'ON' : 'OFF'}
+                </button>
+              </div>`;
+            });
+            micEl.innerHTML = micHtml;
+          }
+        }
       }
     }
 
@@ -1664,6 +1710,30 @@ async function setVolume(val) {
     });
   } catch (e) {
     console.error('Volume set failed:', e);
+  }
+}
+
+// --- Mic gain / switch control ---
+async function setMicGain(control, value) {
+  try {
+    await apiCall('/api/sensors/mic', {
+      method: 'POST',
+      body: JSON.stringify({ control, value }),
+    });
+  } catch (e) {
+    console.error('Mic gain set failed:', e);
+  }
+}
+
+async function toggleMicSwitch(control, value) {
+  try {
+    await apiCall('/api/sensors/mic', {
+      method: 'POST',
+      body: JSON.stringify({ control, value }),
+    });
+    loadSensors();
+  } catch (e) {
+    console.error('Mic switch toggle failed:', e);
   }
 }
 
