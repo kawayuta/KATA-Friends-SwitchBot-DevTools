@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import time
 import uuid
 
@@ -419,6 +420,348 @@ def custom_llm_call():
         "error": f"no output after {MAX_RETRIES} attempts ({last_error})",
         "prompt": filled,
     })
+
+
+# --- Sensors ---
+
+_prev_cpu = None  # (idle, total) for CPU delta calculation
+
+
+def _read_file(path):
+    """Read a sysfs/proc file, return stripped content or None."""
+    try:
+        with open(path, "r") as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def _read_thermal_zones():
+    """Read all thermal_zone temperatures."""
+    zones = []
+    for i in range(10):
+        temp_str = _read_file(f"/sys/class/thermal/thermal_zone{i}/temp")
+        if temp_str is None:
+            break
+        type_str = _read_file(f"/sys/class/thermal/thermal_zone{i}/type") or f"zone{i}"
+        try:
+            temp_c = int(temp_str) / 1000.0
+        except ValueError:
+            temp_c = 0
+        zones.append({"zone": i, "type": type_str, "temp": round(temp_c, 1)})
+    return zones
+
+
+def _read_adc():
+    """Read ADC channels from iio:device0."""
+    base = "/sys/bus/iio/devices/iio:device0"
+    scale_str = _read_file(f"{base}/in_voltage_scale")
+    scale = float(scale_str) if scale_str else 1.0
+    channels = []
+    for ch in range(8):
+        raw_str = _read_file(f"{base}/in_voltage{ch}_raw")
+        if raw_str is None:
+            continue
+        try:
+            raw = int(raw_str)
+        except ValueError:
+            raw = 0
+        voltage = round(raw * scale / 1000.0, 3)
+        channels.append({"channel": ch, "raw": raw, "voltage": voltage})
+    return {"channels": channels, "scale": scale}
+
+
+def _read_touch():
+    """Read touch sensor sensitivity."""
+    val = _read_file("/sys/bus/i2c/devices/6-0058/sensitivity")
+    return {"sensitivity": int(val) if val else None}
+
+
+def _read_leds():
+    """Read LED brightness values."""
+    leds = []
+    led_dirs = sorted(glob.glob("/sys/class/leds/*/"))
+    for d in led_dirs:
+        name = os.path.basename(d.rstrip("/"))
+        brightness = _read_file(os.path.join(d, "brightness"))
+        max_br = _read_file(os.path.join(d, "max_brightness"))
+        if brightness is not None:
+            leds.append({
+                "name": name,
+                "brightness": int(brightness),
+                "max_brightness": int(max_br) if max_br else None,
+            })
+    return leds
+
+
+def _read_npu():
+    """Read NPU load from debugfs."""
+    val = _read_file("/sys/kernel/debug/rknpu/load")
+    if not val:
+        return {"raw": None, "cores": []}
+    # Format example: "Core0: 35%, Core1: 35%"
+    cores = []
+    for m in re.finditer(r'Core(\d+):\s*(\d+)%', val):
+        cores.append({"core": int(m.group(1)), "load": int(m.group(2))})
+    return {"raw": val, "cores": cores}
+
+
+def _read_cpu():
+    """Read CPU usage from /proc/stat (delta between calls)."""
+    global _prev_cpu
+    line = _read_file("/proc/stat")
+    if not line:
+        return {"percent": None}
+    first_line = line.split("\n")[0]  # "cpu  user nice system idle ..."
+    parts = first_line.split()
+    if len(parts) < 5:
+        return {"percent": None}
+    values = [int(x) for x in parts[1:]]
+    idle = values[3]
+    total = sum(values)
+    if _prev_cpu:
+        prev_idle, prev_total = _prev_cpu
+        d_idle = idle - prev_idle
+        d_total = total - prev_total
+        percent = round((1 - d_idle / d_total) * 100, 1) if d_total > 0 else 0
+    else:
+        percent = None  # first call, no delta yet
+    _prev_cpu = (idle, total)
+    return {"percent": percent}
+
+
+def _read_memory():
+    """Read memory info from /proc/meminfo."""
+    content = _read_file("/proc/meminfo")
+    if not content:
+        return {}
+    info = {}
+    for line in content.split("\n"):
+        parts = line.split(":")
+        if len(parts) == 2:
+            key = parts[0].strip()
+            val = parts[1].strip().split()[0]  # value in kB
+            if key in ("MemTotal", "MemFree", "MemAvailable", "Buffers", "Cached", "SwapTotal", "SwapFree"):
+                try:
+                    info[key] = int(val)
+                except ValueError:
+                    pass
+    total = info.get("MemTotal", 0)
+    available = info.get("MemAvailable", 0)
+    used = total - available
+    return {
+        "total_kb": total,
+        "available_kb": available,
+        "used_kb": used,
+        "percent": round(used / total * 100, 1) if total > 0 else 0,
+    }
+
+
+def _read_i2c_devices():
+    """List I2C device names."""
+    devices = []
+    for path in sorted(glob.glob("/sys/bus/i2c/devices/*/name")):
+        name = _read_file(path)
+        bus_addr = path.split("/")[-2]
+        if name:
+            devices.append({"bus_addr": bus_addr, "name": name})
+    return devices
+
+
+def _read_cameras():
+    """List video4linux camera devices."""
+    cameras = []
+    for d in sorted(glob.glob("/sys/class/video4linux/*/")):
+        dev_name = os.path.basename(d.rstrip("/"))
+        name = _read_file(os.path.join(d, "name")) or dev_name
+        cameras.append({"device": dev_name, "name": name})
+    return cameras
+
+
+def _read_audio():
+    """Read audio/speaker info from ALSA."""
+    info = {"cards": [], "volume": None}
+    # Sound cards
+    cards_str = _read_file("/proc/asound/cards")
+    if cards_str:
+        for m in re.finditer(r'^\s*(\d+)\s+\[(\w+)\s*\]:\s*(.+)$', cards_str, re.MULTILINE):
+            info["cards"].append({
+                "id": int(m.group(1)),
+                "name": m.group(2),
+                "description": m.group(3).strip(),
+            })
+    # Volume via amixer (best-effort)
+    try:
+        out = subprocess.check_output(
+            ["amixer", "get", "Master"], timeout=3, stderr=subprocess.DEVNULL
+        ).decode(errors="ignore")
+        m = re.search(r'\[(\d+)%\]', out)
+        if m:
+            info["volume"] = int(m.group(1))
+        m2 = re.search(r'\[(on|off)\]', out)
+        if m2:
+            info["mute"] = m2.group(1) == "off"
+    except Exception:
+        pass
+    return info
+
+
+def _read_battery():
+    """Read battery / power supply info."""
+    supplies = []
+    for d in sorted(glob.glob("/sys/class/power_supply/*/")):
+        name = os.path.basename(d.rstrip("/"))
+        ptype = _read_file(os.path.join(d, "type")) or "Unknown"
+        entry = {"name": name, "type": ptype}
+        for key in ("status", "capacity", "voltage_now", "current_now", "charge_full", "charge_now", "online"):
+            val = _read_file(os.path.join(d, key))
+            if val is not None:
+                try:
+                    entry[key] = int(val)
+                except ValueError:
+                    entry[key] = val
+        supplies.append(entry)
+    return supplies
+
+
+def _read_wifi():
+    """Read WiFi signal info from /proc/net/wireless."""
+    content = _read_file("/proc/net/wireless")
+    if not content:
+        return {}
+    lines = content.strip().split("\n")
+    # Skip header lines
+    for line in lines[2:]:
+        parts = line.split()
+        if len(parts) >= 4:
+            iface = parts[0].rstrip(":")
+            return {
+                "interface": iface,
+                "link": float(parts[2].rstrip(".")),
+                "level_dbm": float(parts[3].rstrip(".")),
+                "noise_dbm": float(parts[4].rstrip(".")) if len(parts) > 4 else None,
+            }
+    return {}
+
+
+def _read_disk():
+    """Read disk usage via statvfs."""
+    mounts = ["/", "/data"]
+    disks = []
+    for mp in mounts:
+        try:
+            st = os.statvfs(mp)
+            total = st.f_frsize * st.f_blocks
+            free = st.f_frsize * st.f_bavail
+            used = total - free
+            disks.append({
+                "mount": mp,
+                "total_mb": round(total / 1048576),
+                "used_mb": round(used / 1048576),
+                "free_mb": round(free / 1048576),
+                "percent": round(used / total * 100, 1) if total > 0 else 0,
+            })
+        except Exception:
+            pass
+    return disks
+
+
+def _read_lidar():
+    """Read LiDAR device info if available."""
+    # Common sysfs paths for USB/serial LiDAR
+    info = {}
+    for path in glob.glob("/sys/class/tty/ttyUSB*/device/interface"):
+        val = _read_file(path)
+        if val:
+            dev = path.split("/")[4]
+            info[dev] = val
+    # Also check for rplidar or similar
+    for path in glob.glob("/dev/ttyUSB*"):
+        dev = os.path.basename(path)
+        if dev not in info:
+            info[dev] = "serial device"
+    return info
+
+
+@app.get("/api/sensors")
+def get_sensors():
+    """Return all hardware sensor data."""
+    return jsonify({
+        "thermal": _read_thermal_zones(),
+        "adc": _read_adc(),
+        "touch": _read_touch(),
+        "leds": _read_leds(),
+        "npu": _read_npu(),
+        "cpu": _read_cpu(),
+        "memory": _read_memory(),
+        "i2c_devices": _read_i2c_devices(),
+        "cameras": _read_cameras(),
+        "audio": _read_audio(),
+        "battery": _read_battery(),
+        "wifi": _read_wifi(),
+        "disk": _read_disk(),
+        "lidar": _read_lidar(),
+        "timestamp": time.time(),
+    })
+
+
+@app.get("/api/sensors/camera/snapshot")
+def camera_snapshot():
+    """Capture a live frame from ISP selfpath and return as JPEG."""
+    from flask import Response
+
+    video_dev = "/dev/video12"  # rkisp_selfpath
+    width, height = 640, 480
+    try:
+        # v4l2-ctl captures one NV12 frame, ffmpeg converts to JPEG
+        v4l2 = subprocess.Popen(
+            ["v4l2-ctl", "-d", video_dev,
+             "--set-fmt-video", f"width={width},height={height},pixelformat=NV12",
+             "--stream-mmap", "--stream-count=1", "--stream-to=-"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        ffmpeg = subprocess.Popen(
+            ["ffmpeg", "-loglevel", "error",
+             "-f", "rawvideo", "-pix_fmt", "nv12",
+             "-video_size", f"{width}x{height}",
+             "-i", "-", "-frames:v", "1",
+             "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "3", "-"],
+            stdin=v4l2.stdout, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        v4l2.stdout.close()
+        jpeg_data, _ = ffmpeg.communicate(timeout=5)
+        v4l2.wait(timeout=2)
+        if not jpeg_data:
+            return flask_error(500, "empty frame")
+        return Response(jpeg_data, mimetype="image/jpeg",
+                        headers={"Cache-Control": "no-cache, no-store"})
+    except subprocess.TimeoutExpired:
+        for p in (v4l2, ffmpeg):
+            try:
+                p.kill()
+            except Exception:
+                pass
+        return flask_error(504, "capture timeout")
+    except Exception as e:
+        return flask_error(500, f"capture failed: {e}")
+
+
+@app.post("/api/sensors/volume")
+def set_volume():
+    """Set master volume via amixer."""
+    data = request.get_json(force=True)
+    volume = data.get("volume")
+    if volume is None:
+        return flask_error(400, "volume is required")
+    volume = max(0, min(100, int(volume)))
+    try:
+        subprocess.check_output(
+            ["amixer", "set", "Master", f"{volume}%"],
+            timeout=5, stderr=subprocess.DEVNULL,
+        )
+        return jsonify({"status": "ok", "volume": volume})
+    except Exception as e:
+        return flask_error(502, f"amixer failed: {e}")
 
 
 @app.get("/api/health")

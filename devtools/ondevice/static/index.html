@@ -57,6 +57,7 @@
       <button onclick="switchTab('camera')" id="tab-camera" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition">Camera</button>
       <button onclick="switchTab('custom')" id="tab-custom" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition">Custom LLM</button>
       <button onclick="switchTab('prompt')" id="tab-prompt" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition">Prompt</button>
+      <button onclick="switchTab('sensors')" id="tab-sensors" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition">Sensors</button>
       <button onclick="switchTab('events')" id="tab-events" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition">Events</button>
       <button onclick="switchTab('status')" id="tab-status" class="px-4 py-2 border-b-2 border-transparent hover:text-kata-500 transition">Status</button>
     </div>
@@ -294,6 +295,52 @@
       </div>
     </div>
 
+    <!-- Sensors Tab -->
+    <div id="panel-sensors" class="tab-panel hidden">
+      <div class="flex items-center gap-2 mb-4">
+        <button onclick="loadSensors()" class="bg-kata-500 hover:bg-kata-600 text-black font-medium px-4 py-2 rounded transition">更新</button>
+        <label class="text-sm text-gray-400">
+          <input type="checkbox" id="sensors-auto" class="mr-1" onchange="toggleSensorsAutoRefresh()"> 自動更新 (2s)
+        </label>
+        <span id="sensors-ts" class="text-sm text-gray-500 ml-auto"></span>
+      </div>
+      <!-- Camera live preview (outside sensors-content so it survives innerHTML updates) -->
+      <div id="sensors-camera-section" class="mb-4 hidden">
+        <h3 class="text-sm font-semibold text-gray-400 mb-2">カメラ</h3>
+        <div class="bg-gray-800 rounded p-4">
+          <div class="flex items-center gap-2 mb-3">
+            <button onclick="refreshCameraPreview()" class="bg-kata-500 hover:bg-kata-600 text-black text-sm font-medium px-3 py-1 rounded transition">スナップ</button>
+            <label class="text-sm text-gray-400"><input type="checkbox" id="camera-live" class="mr-1" onchange="toggleCameraLive()"> ライブ (2s)</label>
+            <span id="camera-status" class="text-xs text-gray-500 ml-auto"></span>
+          </div>
+          <div class="flex justify-center mb-3">
+            <img id="camera-preview" src="" alt="カメラプレビュー" class="max-w-full rounded border border-gray-700 hidden" style="max-height:400px">
+            <div id="camera-placeholder" class="text-gray-500 text-sm py-8">「スナップ」でライブフレームを取得</div>
+          </div>
+          <div id="camera-devices" class="border-t border-gray-700 pt-2 hidden"></div>
+        </div>
+      </div>
+      <!-- Audio volume (outside sensors-content so slider survives updates) -->
+      <div id="sensors-audio-section" class="mb-4 hidden">
+        <h3 class="text-sm font-semibold text-gray-400 mb-2">オーディオ</h3>
+        <div class="bg-gray-800 rounded p-4">
+          <div id="audio-volume-row" class="flex items-center gap-3 mb-2 hidden">
+            <span class="text-sm text-gray-400 w-14">Master</span>
+            <input type="range" id="volume-slider" min="0" max="100" value="0"
+              class="flex-1 h-2 rounded-lg appearance-none cursor-pointer accent-indigo-500 bg-gray-600"
+              oninput="document.getElementById('volume-val').textContent=this.value+'%'"
+              onchange="setVolume(this.value)">
+            <span id="volume-val" class="text-sm w-12 text-right font-mono">0%</span>
+            <span id="audio-mute-badge" class="text-xs text-red-400 hidden">MUTE</span>
+          </div>
+          <div id="audio-cards"></div>
+        </div>
+      </div>
+      <div id="sensors-content">
+        <p class="text-gray-500">データを読み込むには「更新」をクリック</p>
+      </div>
+    </div>
+
     <!-- Events Tab -->
     <div id="panel-events" class="tab-panel hidden">
       <div class="flex items-center gap-2 mb-4">
@@ -315,7 +362,7 @@
 
 <script>
 // --- Tab switching ---
-const tabs = ['action', 'zmq', 'diary', 'local', 'camera', 'custom', 'prompt', 'events', 'status'];
+const tabs = ['action', 'zmq', 'diary', 'local', 'camera', 'custom', 'prompt', 'sensors', 'events', 'status'];
 function switchTab(name) {
   tabs.forEach(t => {
     document.getElementById(`panel-${t}`).classList.toggle('hidden', t !== name);
@@ -1343,7 +1390,292 @@ switchTab = function(name) {
     diaryLoaded = true;
     loadDiaryRecords();
   }
+  if (name === 'sensors') {
+    loadSensors();
+  }
 };
+
+// --- Sensors ---
+let sensorsTimer = null;
+
+function tempColor(t) {
+  if (t >= 80) return 'text-red-400';
+  if (t >= 60) return 'text-yellow-400';
+  return 'text-green-400';
+}
+
+function barHtml(percent, color = 'bg-kata-500') {
+  const p = Math.min(100, Math.max(0, percent || 0));
+  return `<div class="w-full bg-gray-700 rounded h-3 overflow-hidden"><div class="${color} h-full rounded" style="width:${p}%"></div></div>`;
+}
+
+async function loadSensors() {
+  try {
+    const d = await apiCall('/api/sensors');
+    const el = document.getElementById('sensors-content');
+    const ts = d.timestamp ? new Date(d.timestamp * 1000).toLocaleTimeString() : '';
+    document.getElementById('sensors-ts').textContent = ts;
+
+    let html = '';
+
+    // Thermal
+    if (d.thermal && d.thermal.length) {
+      html += `<div class="mb-4"><h3 class="text-sm font-semibold text-gray-400 mb-2">温度センサー</h3>
+        <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-2">`;
+      d.thermal.forEach(z => {
+        html += `<div class="bg-gray-800 rounded p-3 text-center">
+          <div class="text-xs text-gray-400">${z.type}</div>
+          <div class="${tempColor(z.temp)} text-lg font-bold">${z.temp}°C</div>
+        </div>`;
+      });
+      html += `</div></div>`;
+    }
+
+    // NPU / CPU / Memory
+    html += `<div class="mb-4"><h3 class="text-sm font-semibold text-gray-400 mb-2">NPU / システム</h3>
+      <div class="bg-gray-800 rounded p-4 space-y-3">`;
+    // NPU
+    if (d.npu && d.npu.cores && d.npu.cores.length) {
+      html += `<div class="flex items-center gap-3"><span class="w-12 text-sm text-gray-400">NPU</span><div class="flex-1 space-y-1">`;
+      d.npu.cores.forEach(c => {
+        html += `<div class="flex items-center gap-2"><span class="text-xs text-gray-500 w-14">Core${c.core}</span>
+          <div class="flex-1">${barHtml(c.load, 'bg-purple-500')}</div>
+          <span class="text-xs w-10 text-right">${c.load}%</span></div>`;
+      });
+      html += `</div></div>`;
+    } else {
+      html += `<div class="flex items-center gap-3"><span class="w-12 text-sm text-gray-400">NPU</span><span class="text-gray-500 text-sm">${d.npu?.raw || 'N/A'}</span></div>`;
+    }
+    // CPU
+    const cpuPct = d.cpu?.percent;
+    html += `<div class="flex items-center gap-3"><span class="w-12 text-sm text-gray-400">CPU</span>
+      <div class="flex-1">${barHtml(cpuPct, 'bg-blue-500')}</div>
+      <span class="text-xs w-10 text-right">${cpuPct != null ? cpuPct + '%' : '...'}</span></div>`;
+    // Memory
+    const mem = d.memory || {};
+    const memPct = mem.percent || 0;
+    const memUsedG = mem.used_kb ? (mem.used_kb / 1048576).toFixed(1) : '?';
+    const memTotalG = mem.total_kb ? (mem.total_kb / 1048576).toFixed(1) : '?';
+    html += `<div class="flex items-center gap-3"><span class="w-12 text-sm text-gray-400">RAM</span>
+      <div class="flex-1">${barHtml(memPct, 'bg-green-500')}</div>
+      <span class="text-xs w-24 text-right">${memUsedG}G / ${memTotalG}G</span></div>`;
+    html += `</div></div>`;
+
+    // ADC
+    if (d.adc && d.adc.channels && d.adc.channels.length) {
+      html += `<div class="mb-4"><h3 class="text-sm font-semibold text-gray-400 mb-2">ADC (電圧)</h3>
+        <div class="grid grid-cols-4 gap-2">`;
+      d.adc.channels.forEach(ch => {
+        html += `<div class="bg-gray-800 rounded p-2 text-center">
+          <div class="text-xs text-gray-400">ch${ch.channel}</div>
+          <div class="text-sm font-mono">${ch.voltage}V</div>
+        </div>`;
+      });
+      html += `</div></div>`;
+    }
+
+    // Touch + LED
+    html += `<div class="mb-4"><h3 class="text-sm font-semibold text-gray-400 mb-2">タッチセンサー / LED</h3>
+      <div class="bg-gray-800 rounded p-4">`;
+    // Touch
+    if (d.touch?.sensitivity != null) {
+      html += `<div class="mb-2"><span class="text-sm text-gray-400">gtx315l 感度: </span><span class="font-mono">${d.touch.sensitivity}</span></div>`;
+    }
+    // LEDs
+    if (d.leds && d.leds.length) {
+      html += `<div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2 mt-2">`;
+      d.leds.forEach(led => {
+        const on = led.brightness > 0;
+        html += `<div class="flex items-center gap-2 text-sm">
+          <span class="${on ? 'text-yellow-400' : 'text-gray-600'} text-lg">${on ? '\u25CF' : '\u25CB'}</span>
+          <span class="text-gray-300 truncate">${led.name}</span>
+          <span class="text-gray-500 ml-auto">${led.brightness}${led.max_brightness != null ? '/' + led.max_brightness : ''}</span>
+        </div>`;
+      });
+      html += `</div>`;
+    }
+    html += `</div></div>`;
+
+    // Disk
+    if (d.disk && d.disk.length) {
+      html += `<div class="mb-4"><h3 class="text-sm font-semibold text-gray-400 mb-2">ストレージ</h3>
+        <div class="bg-gray-800 rounded p-4 space-y-2">`;
+      d.disk.forEach(dk => {
+        const usedG = (dk.used_mb / 1024).toFixed(1);
+        const totalG = (dk.total_mb / 1024).toFixed(1);
+        const color = dk.percent >= 90 ? 'bg-red-500' : dk.percent >= 70 ? 'bg-yellow-500' : 'bg-cyan-500';
+        html += `<div class="flex items-center gap-3">
+          <span class="w-16 text-sm text-gray-400 font-mono">${dk.mount}</span>
+          <div class="flex-1">${barHtml(dk.percent, color)}</div>
+          <span class="text-xs w-28 text-right">${usedG}G / ${totalG}G</span></div>`;
+      });
+      html += `</div></div>`;
+    }
+
+    // WiFi
+    if (d.wifi && d.wifi.interface) {
+      const rssi = d.wifi.level_dbm;
+      const sigPct = Math.min(100, Math.max(0, (rssi + 100) * 2));
+      const sigColor = sigPct >= 60 ? 'text-green-400' : sigPct >= 30 ? 'text-yellow-400' : 'text-red-400';
+      html += `<div class="mb-4"><h3 class="text-sm font-semibold text-gray-400 mb-2">WiFi</h3>
+        <div class="bg-gray-800 rounded p-4">
+          <div class="flex items-center gap-4">
+            <span class="text-sm text-gray-400">${d.wifi.interface}</span>
+            <span class="${sigColor} font-mono">${rssi} dBm</span>
+            <div class="flex-1">${barHtml(sigPct, sigPct >= 60 ? 'bg-green-500' : sigPct >= 30 ? 'bg-yellow-500' : 'bg-red-500')}</div>
+            <span class="text-xs text-gray-500">Link: ${d.wifi.link}</span>
+          </div>
+        </div></div>`;
+    }
+
+    // Battery
+    if (d.battery && d.battery.length) {
+      html += `<div class="mb-4"><h3 class="text-sm font-semibold text-gray-400 mb-2">電源</h3>
+        <div class="bg-gray-800 rounded p-4 space-y-2">`;
+      d.battery.forEach(b => {
+        html += `<div class="flex items-center gap-3 text-sm">
+          <span class="text-gray-400 w-24">${b.name}</span>
+          <span class="text-gray-500">${b.type}</span>`;
+        if (b.capacity != null) {
+          const batColor = b.capacity >= 50 ? 'bg-green-500' : b.capacity >= 20 ? 'bg-yellow-500' : 'bg-red-500';
+          html += `<div class="flex-1">${barHtml(b.capacity, batColor)}</div>
+            <span class="text-xs w-10 text-right">${b.capacity}%</span>`;
+        }
+        if (b.voltage_now != null) html += `<span class="text-gray-500 text-xs">${(b.voltage_now / 1000000).toFixed(2)}V</span>`;
+        if (b.status) html += `<span class="text-xs text-gray-400">${b.status}</span>`;
+        if (b.online != null) html += `<span class="text-xs ${b.online ? 'text-green-400' : 'text-gray-500'}">${b.online ? 'Online' : 'Offline'}</span>`;
+        html += `</div>`;
+      });
+      html += `</div></div>`;
+    }
+
+    // Camera — update fixed section
+    {
+      const camSection = document.getElementById('sensors-camera-section');
+      const camDevices = document.getElementById('camera-devices');
+      if (camSection) camSection.classList.remove('hidden');
+      if (d.cameras && d.cameras.length && camDevices) {
+        camDevices.classList.remove('hidden');
+        camDevices.innerHTML = `<div class="grid grid-cols-1 sm:grid-cols-2 gap-1">` +
+          d.cameras.map(cam => `<div class="text-sm flex items-center gap-2">
+            <span class="text-green-400">\u25CF</span>
+            <span class="text-gray-500 font-mono">/dev/${cam.device}</span>
+            <span class="text-gray-300">${cam.name}</span></div>`).join('') + `</div>`;
+      }
+    }
+
+    // Audio — update fixed section
+    {
+      const audioSection = document.getElementById('sensors-audio-section');
+      const vol = d.audio?.volume;
+      const hasAudio = d.audio && (d.audio.cards?.length || vol != null);
+      if (hasAudio && audioSection) {
+        audioSection.classList.remove('hidden');
+        if (vol != null) {
+          const volRow = document.getElementById('audio-volume-row');
+          if (volRow) volRow.classList.remove('hidden');
+          const slider = document.getElementById('volume-slider');
+          // Only update if user is not actively dragging
+          if (slider && document.activeElement !== slider) {
+            slider.value = vol;
+            document.getElementById('volume-val').textContent = vol + '%';
+          }
+          const muteBadge = document.getElementById('audio-mute-badge');
+          if (muteBadge) muteBadge.classList.toggle('hidden', !d.audio.mute);
+        }
+        const cardsEl = document.getElementById('audio-cards');
+        if (d.audio.cards?.length && cardsEl) {
+          cardsEl.innerHTML = d.audio.cards.map(c =>
+            `<div class="text-sm text-gray-400"><span class="font-mono text-gray-500">[${c.id}]</span> ${c.name} — ${c.description}</div>`
+          ).join('');
+        }
+      }
+    }
+
+    // LiDAR
+    if (d.lidar && Object.keys(d.lidar).length) {
+      html += `<div class="mb-4"><h3 class="text-sm font-semibold text-gray-400 mb-2">LiDAR / シリアル</h3>
+        <div class="bg-gray-800 rounded p-3">`;
+      Object.entries(d.lidar).forEach(([dev, desc]) => {
+        html += `<div class="text-sm"><span class="text-gray-500 font-mono">/dev/${dev}</span> <span class="text-gray-300">${desc}</span></div>`;
+      });
+      html += `</div></div>`;
+    }
+
+    // I2C Devices
+    if (d.i2c_devices && d.i2c_devices.length) {
+      html += `<div class="mb-4"><h3 class="text-sm font-semibold text-gray-400 mb-2">I2C デバイス</h3>
+        <div class="bg-gray-800 rounded p-3"><div class="grid grid-cols-1 sm:grid-cols-2 gap-1">`;
+      d.i2c_devices.forEach(dev => {
+        html += `<div class="text-sm"><span class="text-gray-500 font-mono">${dev.bus_addr}</span> <span class="text-gray-300">${dev.name}</span></div>`;
+      });
+      html += `</div></div></div>`;
+    }
+
+    el.innerHTML = html;
+  } catch (e) {
+    document.getElementById('sensors-content').innerHTML = `<p class="text-red-400">${e.message}</p>`;
+  }
+}
+
+// --- Sensors camera live preview ---
+let liveCamTimer = null;
+let liveCamBusy = false;
+
+function refreshCameraPreview() {
+  if (liveCamBusy) return;
+  const img = document.getElementById('camera-preview');
+  const placeholder = document.getElementById('camera-placeholder');
+  const status = document.getElementById('camera-status');
+  if (!img) return;
+  liveCamBusy = true;
+  if (status) status.textContent = '取得中...';
+  const newImg = new Image();
+  newImg.onload = () => {
+    img.src = newImg.src;
+    img.classList.remove('hidden');
+    if (placeholder) placeholder.classList.add('hidden');
+    if (status) status.textContent = new Date().toLocaleTimeString();
+    liveCamBusy = false;
+  };
+  newImg.onerror = () => {
+    if (status) status.textContent = 'エラー';
+    liveCamBusy = false;
+  };
+  newImg.src = '/api/sensors/camera/snapshot?t=' + Date.now();
+}
+
+function toggleCameraLive() {
+  if (document.getElementById('camera-live').checked) {
+    refreshCameraPreview();
+    liveCamTimer = setInterval(refreshCameraPreview, 2000);
+  } else {
+    clearInterval(liveCamTimer);
+    liveCamTimer = null;
+  }
+}
+
+// --- Volume control ---
+async function setVolume(val) {
+  try {
+    await apiCall('/api/sensors/volume', {
+      method: 'POST',
+      body: JSON.stringify({ volume: parseInt(val) }),
+    });
+  } catch (e) {
+    console.error('Volume set failed:', e);
+  }
+}
+
+function toggleSensorsAutoRefresh() {
+  if (document.getElementById('sensors-auto').checked) {
+    loadSensors();
+    sensorsTimer = setInterval(loadSensors, 2000);
+  } else {
+    clearInterval(sensorsTimer);
+    sensorsTimer = null;
+  }
+}
 
 // --- Status ---
 async function checkHealth() {
@@ -1418,7 +1750,7 @@ function truncBody(obj, max = 300) {
   return s.length > max ? s.slice(0, max) + '...' : s;
 }
 
-initLogPanel();
+document.addEventListener('DOMContentLoaded', initLogPanel);
 </script>
 
   <!-- Log Panel -->
