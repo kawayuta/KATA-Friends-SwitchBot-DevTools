@@ -94,13 +94,15 @@ Stored in `/data/ai_brain/`.
 
 | Model | Path | Size | Purpose |
 |---|---|---|---|
-| Qwen3-1.7B | `Qwen3-1.7B_w8a8_RK3576_v3.rkllm` | 2.2GB | Diary generation |
+| Qwen3-1.7B | `Qwen3-1.7B_w8a8_RK3576_v3.rkllm` | 2.2GB | Diary generation (legacy) |
+| Qwen3-VL-2B (VLM) | `vlm/qwen3-vl-2b-instruct_w4a16_g128_rk3576.rkllm` | 1.7GB | Diary generation (VLM) |
+| Qwen3-VL-2B Vision | `vlm/qwen3-vl-2b_vision_rk3576.rknn` | 831MB | VLM vision encoder |
 | Action Model (Qwen3 LoRA SFT) | `qwen3_v7.0.2_lora_sft_nothink_*.rkllm` | 900MB | Action classification |
 | Action Model v1.1 | `actionmodel_w8a8_RK3576_v1.1.rkllm` | 900MB | Legacy action model |
 
 Symlinks:
 - `actionmodel.rkllm` → latest action model
-- `diarymodel.rkllm` → Qwen3-1.7B
+- `diarymodel.rkllm` → VLM model (`vlm/qwen3-vl-2b-instruct_w4a16_g128_rk3576.rkllm`)
 
 ### Voice Recognition Models
 
@@ -215,7 +217,7 @@ media/
 | 5558 | master (ZMQ XPUB) | ZMQ subscriber port (internal IPC) |
 | 5559 | master (ZMQ XSUB) | ZMQ publisher port (internal IPC, sensor data flows here) |
 | 8080 | flask_server_action.py | LLM action: takes voice text, returns `mood/instruction` |
-| 8082 | flask_server_diary.py | LLM diary: generates diary from event list |
+| 8082 | flask_server_diary.py | LLM diary: generates diary from event list + VLM image inference |
 | 8083 | route.py | Unified router: auto-detects and routes to 8080/8082 |
 | 27999 | control_center_runner (C++) | Local API: photos, faces, storage (auth required) |
 | 50001 | control_center_runner (C++) | Unknown (externally accessible) |
@@ -407,6 +409,14 @@ Web-based developer tools running directly on the device (Flask + vanilla JS SPA
 bash scripts/deploy_devtools.sh [KATA_IP]
 ```
 
+### VLM Setup
+
+Automated setup for VLM (Vision Language Model) on a new device. Handles rknn-llm clone, model download, librkllmrt.so upgrade (1.2.1 → 1.2.3), flask_server_diary.py deployment, symlink creation, reboot, and verification.
+
+```bash
+bash devtools/setup_vlm.sh [KATA_IP]
+```
+
 ### Features (10 Tabs)
 
 | Tab | Description |
@@ -534,12 +544,13 @@ mood/instruction
 
 ### Overview
 
-Generates a first-person diary entry from the day's interaction events, written in Pixar-style warm narrative.
+Generates a first-person diary entry from the day's interaction events, written in Pixar-style warm narrative. Uses persistent model loading (model loaded once at startup, reused for all requests).
 
-### Endpoint
+### Endpoints
 
 ```
-POST http://<KATA_IP>:8082/rkllm_diary
+POST http://<KATA_IP>:8082/rkllm_diary    # Text-only diary generation
+POST http://<KATA_IP>:8082/rkllm_vlm      # VLM image+text inference (via C++ demo binary)
 Content-Type: application/json
 
 {

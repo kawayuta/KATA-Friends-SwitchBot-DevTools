@@ -105,13 +105,15 @@ sweepbot/
 
 | モデル | パス | サイズ | 用途 |
 |---|---|---|---|
-| Qwen3-1.7B | `Qwen3-1.7B_w8a8_RK3576_v3.rkllm` | 2.2GB | 日記生成 |
+| Qwen3-1.7B | `Qwen3-1.7B_w8a8_RK3576_v3.rkllm` | 2.2GB | 日記生成 (旧) |
+| Qwen3-VL-2B (VLM) | `vlm/qwen3-vl-2b-instruct_w4a16_g128_rk3576.rkllm` | 1.7GB | 日記生成 (VLM) |
+| Qwen3-VL-2B Vision | `vlm/qwen3-vl-2b_vision_rk3576.rknn` | 831MB | VLMビジョンエンコーダ |
 | Action Model (Qwen3 LoRA SFT) | `qwen3_v7.0.2_lora_sft_nothink_*.rkllm` | 900MB | アクション判定 |
 | Action Model v1.1 | `actionmodel_w8a8_RK3576_v1.1.rkllm` | 900MB | 旧アクションモデル |
 
 シンボリックリンク:
 - `actionmodel.rkllm` → 最新のアクションモデル
-- `diarymodel.rkllm` → Qwen3-1.7B
+- `diarymodel.rkllm` → VLMモデル (`vlm/qwen3-vl-2b-instruct_w4a16_g128_rk3576.rkllm`)
 
 ### 音声認識モデル
 
@@ -254,7 +256,7 @@ media/
 | 5558 | master (ZMQ XPUB) | ZMQサブスクライバーポート（内部IPC） |
 | 5559 | master (ZMQ XSUB) | ZMQパブリッシャーポート（内部IPC、センサーデータ流通） |
 | 8080 | flask_server_action.py | LLMアクション判定。音声テキストを受け取り `mood/instruction` を返す |
-| 8082 | flask_server_diary.py | LLM日記生成。イベントリストから日記を生成 |
+| 8082 | flask_server_diary.py | LLM日記生成 + VLM画像推論 |
 | 8083 | route.py | 統合ルーター。リクエスト内容に応じて8080/8082に振り分け |
 | 27999 | control_center_runner (C++) | ローカルAPI。写真・顔認識・ストレージ等 (auth必要) |
 | 50001 | control_center_runner (C++) | 不明（外部アクセス可能） |
@@ -446,6 +448,14 @@ python3 scripts/kata_local_api.py storage   # ストレージ情報
 bash scripts/deploy_devtools.sh [KATA_IP]
 ```
 
+### VLMセットアップ
+
+新しいデバイスへのVLM (Vision Language Model) 自動セットアップ。rknn-llm clone、モデルダウンロード、librkllmrt.soアップグレード (1.2.1 → 1.2.3)、flask_server_diary.pyデプロイ、シンボリックリンク作成、リブート、動作確認を一括実行。
+
+```bash
+bash devtools/setup_vlm.sh [KATA_IP]
+```
+
 ### タブ一覧（10タブ）
 
 | タブ | 機能 |
@@ -573,12 +583,13 @@ mood/instruction
 
 ### 概要
 
-1日のインタラクションイベントから、AIペット視点の日記を生成する。
+1日のインタラクションイベントから、AIペット視点の日記を生成する。persistent model方式（起動時に1回ロード、リクエスト毎に再利用）。
 
 ### エンドポイント
 
 ```
-POST http://<KATA_IP>:8082/rkllm_diary
+POST http://<KATA_IP>:8082/rkllm_diary    # テキスト日記生成
+POST http://<KATA_IP>:8082/rkllm_vlm      # VLM画像+テキスト推論 (C++ demoバイナリ経由)
 Content-Type: application/json
 
 {

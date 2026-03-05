@@ -21,10 +21,12 @@ devtools/
 ├── docker-compose.yml     # Docker Compose 設定
 ├── requirements.txt       # Python 依存 (FastAPI版)
 ├── zmq_publish.py         # ZMQ publish スクリプト (Mac版: ADB経由で実行)
+├── setup_vlm.sh           # VLM自動セットアップスクリプト (adb経由)
 ├── static/
 │   └── index.html         # SPA フロントエンド (Mac版)
 ├── ondevice/
 │   ├── app_flask.py       # Flask バックエンド — オンデバイス版
+│   ├── flask_server_diary.py  # LLM日記サーバー (persistent model版, VLM対応)
 │   ├── zmq_publish.py     # ZMQ publish (デバイス上で直接import)
 │   └── static/
 │       └── index.html     # SPA フロントエンド (オンデバイス版)
@@ -1083,10 +1085,14 @@ BLE イベントログの表示。
 
 ### 日記サーバー (:8082)
 
-- **エンドポイント:** `POST /rkllm_diary`
-- **入力:** `{"task": "diary", "prompt": "language:Japanese\nlocal_date:...\nevents:\n..."}`
+- **エンドポイント:** `POST /rkllm_diary` (テキスト日記), `POST /rkllm_vlm` (VLM画像+テキスト)
+- **モデル:** Qwen3-VL-2B (`/data/ai_brain/vlm/`) — persistent model方式 (起動時に1回ロード)
+- **入力 (diary):** `{"task": "diary", "prompt": "language:Japanese\nlocal_date:...\nevents:\n..."}`
+- **入力 (vlm):** `{"prompt": "この画像を説明して", "image_base64": "...", "max_new_tokens": 512}`
 - **認証:** 不要
 - **`task: "custom"` サポート:** `task` に `"custom"` を指定すると、システムプロンプトは読み込まれない (空文字列を返す)。Custom LLM 機能で使用。
+- **librkllmrt.so:** VLMモデルは toolkit 1.2.3 で変換されているため、runtime 1.2.3 以上が必須 (`/data/rknn-llm/` から取得)
+- **ソース:** `devtools/ondevice/flask_server_diary.py` → `setup_vlm.sh` でデプロイ
 
 ### LLM の instruction 集合 (システムプロンプトで定義)
 
