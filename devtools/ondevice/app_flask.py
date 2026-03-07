@@ -455,37 +455,39 @@ def _lmstudio_chat_mcp(base_url, model, messages, config, mcp_servers,
     base_url should be e.g. "http://x.x.x.x:1234" (without /v1).
     Returns (result_text, response_id).
     """
-    # Build input text from messages (system + user)
-    parts = []
-    for msg in messages:
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            # VLM multipart: extract text parts only (images not supported via native API)
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    parts.append(item["text"])
-                elif isinstance(item, str):
-                    parts.append(item)
-        elif isinstance(content, str):
-            parts.append(content)
-    input_text = "\n\n".join(parts)
-
-    # Inject current date + tool use instruction
+    # Build input as flat content parts array for LM Studio /api/v1/chat
     today = datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=9))).strftime("%Y年%m月%d日 %H:%M")
     tool_names = ", ".join(mcp_servers)
-    input_text = (
-        f"<|system|>\n"
-        f"現在の日時: {today}\n"
+    tool_instruction = (
         f"You MUST call at least one tool ({tool_names}) before answering. "
         "You may call tools up to 3 times maximum. After that, give your final answer immediately. "
-        "Do NOT repeat the same search query.\n"
-        f"<|user|>\n{input_text}"
+        "Do NOT repeat the same search query."
     )
+
+    # Flatten messages into content parts: [{type: "text", text: ...}, {type: "image", url: ...}]
+    input_items = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if msg.get("role") == "system" and isinstance(content, str):
+            content = f"現在の日時: {today}\n{tool_instruction}\n\n{content}"
+            input_items.append({"type": "text", "content": content})
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict):
+                    if item.get("type") == "text":
+                        input_items.append({"type": "text", "content": item["text"]})
+                    elif item.get("type") == "image_url":
+                        url = item.get("image_url", {}).get("url", "")
+                        input_items.append({"type": "image", "data_url": url})
+                elif isinstance(item, str):
+                    input_items.append({"type": "text", "content": item})
+        elif isinstance(content, str):
+            input_items.append({"type": "text", "content": content})
 
     integrations = [{"type": "plugin", "id": s} for s in mcp_servers]
     payload = {
         "model": model,
-        "input": input_text,
+        "input": input_items,
         "integrations": integrations,
         "temperature": min(float(config.get("temperature", 0.7)), 1.0),
         "context_length": int(config.get("max_new_tokens", 4096)),
@@ -496,7 +498,11 @@ def _lmstudio_chat_mcp(base_url, model, messages, config, mcp_servers,
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    print(f"[MCP] payload: {json.dumps(payload, ensure_ascii=False)[:500]}")
+    # Log payload summary (truncate image data)
+    has_image = any(item.get("type") == "image" for item in input_items)
+    log_payload = {k: v for k, v in payload.items() if k != "input"}
+    log_payload["input"] = f"[{len(input_items)} parts, image={'yes' if has_image else 'no'}]"
+    print(f"[MCP] payload: {json.dumps(log_payload, ensure_ascii=False)}")
     resp = requests.post(
         f"{base_url}/api/v1/chat",
         json=payload,

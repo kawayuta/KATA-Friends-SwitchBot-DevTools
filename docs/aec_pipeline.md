@@ -117,7 +117,7 @@ The deploy script:
 3. Adds `tts_out` device definition to `asound.conf`
 4. Redirects `record` PCM to `hw:1,1,1` (6ch AEC output loopback)
 5. Updates `aec-pipeline.service` with `ExecStartPost` sleep
-6. Starts `aec_daemon` and restarts `master` service
+6. Starts `aec_daemon` and restarts `media` + `pet_voice` services
 
 ### Changes on Device
 
