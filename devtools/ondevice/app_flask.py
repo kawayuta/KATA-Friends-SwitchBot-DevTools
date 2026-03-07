@@ -1701,6 +1701,30 @@ def tts_synthesize():
     return jsonify({"status": "ok"})
 
 
+# --- Device control ---
+
+@app.post("/api/device/reboot")
+def device_reboot():
+    """Reboot the device."""
+    subprocess.Popen(["reboot"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return jsonify({"status": "ok", "message": "rebooting"})
+
+
+@app.post("/api/service/restart")
+def service_restart():
+    """Restart a specific systemd service."""
+    data = request.get_json(force=True)
+    service = data.get("service", "")
+    allowed = ["kata-devtools", "llm_action", "llm_diary", "llm_route", "master"]
+    if service not in allowed:
+        return flask_error(400, f"service not allowed: {service}")
+    try:
+        rc = os.system(f"systemctl restart {service} 2>/dev/null")
+        return jsonify({"status": "ok" if rc == 0 else "error", "service": service, "rc": rc})
+    except Exception as e:
+        return flask_error(500, str(e))
+
+
 # --- Auto-talk (server-side loop) ---
 
 AUTO_TALK_CONFIG_PATH = "/data/devtools/auto_talk_config.json"
@@ -1813,8 +1837,6 @@ def _auto_talk_loop(text, interval, stop_event):
                 break
             time.sleep(1)
 
-    with _auto_talk_lock:
-        _auto_talk_state["running"] = False
 
 
 @app.get("/api/auto-talk/config")
@@ -1870,7 +1892,8 @@ def auto_talk_stop():
         if not _auto_talk_state["running"]:
             return jsonify({"status": "not_running"})
         _auto_talk_state["stop_event"].set()
-    return jsonify({"status": "stopping"})
+        _auto_talk_state["running"] = False
+    return jsonify({"status": "stopped"})
 
 
 @app.get("/api/auto-talk/status")

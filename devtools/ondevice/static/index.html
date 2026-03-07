@@ -314,9 +314,9 @@
       <details class="mb-4 bg-gray-800 rounded p-3">
         <summary class="text-sm text-gray-300 cursor-pointer select-none">語りかけモード</summary>
         <div class="mt-3 space-y-3">
-          <div class="flex items-center gap-3">
-            <label class="text-xs text-gray-400 w-16">テキスト</label>
-            <input id="auto-talk-text" type="text" value="今何が見える？" class="flex-1 bg-gray-700 border border-gray-600 rounded px-2 py-1 text-sm focus:outline-none focus:border-kata-500">
+          <div>
+            <label class="text-xs text-gray-400 mb-1 block">テキスト</label>
+            <textarea id="auto-talk-text" rows="2" class="w-full bg-gray-700 border border-gray-600 rounded px-2 py-1 text-sm focus:outline-none focus:border-kata-500">今何が見える？</textarea>
           </div>
           <div class="flex items-center gap-3">
             <label class="text-xs text-gray-400 w-16">間隔</label>
@@ -451,6 +451,24 @@
     <div id="panel-status" class="tab-panel hidden">
       <button onclick="checkHealth()" id="status-btn" class="bg-kata-500 hover:bg-kata-600 text-black font-medium px-4 py-2 rounded transition mb-4">チェック</button>
       <div id="status-result" class="space-y-2"></div>
+      <details class="mt-6 bg-gray-800 rounded p-3">
+        <summary class="text-sm text-gray-300 cursor-pointer select-none">サービス再起動</summary>
+        <div class="mt-3 flex flex-wrap gap-2">
+          <button onclick="restartService('kata-devtools')" class="bg-gray-700 hover:bg-gray-600 text-sm px-3 py-1 rounded transition">DevTools</button>
+          <button onclick="restartService('llm_action')" class="bg-gray-700 hover:bg-gray-600 text-sm px-3 py-1 rounded transition">LLM Action</button>
+          <button onclick="restartService('llm_diary')" class="bg-gray-700 hover:bg-gray-600 text-sm px-3 py-1 rounded transition">LLM Diary</button>
+          <button onclick="restartService('llm_route')" class="bg-gray-700 hover:bg-gray-600 text-sm px-3 py-1 rounded transition">LLM Route</button>
+          <button onclick="restartService('master')" class="bg-gray-700 hover:bg-gray-600 text-sm px-3 py-1 rounded transition">Master</button>
+        </div>
+        <div id="restart-status" class="text-xs text-gray-500 mt-2"></div>
+      </details>
+      <details class="mt-3 bg-gray-800 rounded p-3">
+        <summary class="text-sm text-red-400 cursor-pointer select-none">デバイス再起動</summary>
+        <div class="mt-3">
+          <p class="text-xs text-gray-400 mb-2">デバイスを再起動します。全サービスが停止し、再起動まで1〜2分かかります。</p>
+          <button onclick="rebootDevice()" id="reboot-btn" class="bg-red-600 hover:bg-red-700 text-white text-sm px-4 py-2 rounded transition font-medium">デバイス再起動</button>
+        </div>
+      </details>
     </div>
   </div>
 
@@ -2160,6 +2178,38 @@ async function checkHealth() {
   }
   setLoading('status-btn', false);
 }
+
+async function restartService(name) {
+  const el = document.getElementById('restart-status');
+  el.textContent = `${name} を再起動中...`;
+  el.className = 'text-xs text-yellow-400 mt-2';
+  try {
+    const data = await apiCall('/api/service/restart', {
+      method: 'POST',
+      body: JSON.stringify({ service: name }),
+    });
+    el.textContent = `${name}: ${data.status === 'ok' ? '再起動完了' : 'エラー (rc=' + data.rc + ')'}`;
+    el.className = data.status === 'ok' ? 'text-xs text-green-400 mt-2' : 'text-xs text-red-400 mt-2';
+  } catch (e) {
+    el.textContent = `${name}: エラー - ${e.message}`;
+    el.className = 'text-xs text-red-400 mt-2';
+  }
+}
+
+async function rebootDevice() {
+  if (!confirm('デバイスを再起動しますか？')) return;
+  const btn = document.getElementById('reboot-btn');
+  btn.disabled = true;
+  btn.textContent = '再起動中...';
+  try {
+    await apiCall('/api/device/reboot', { method: 'POST' });
+    btn.textContent = '再起動コマンド送信済み';
+  } catch (e) {
+    btn.textContent = '再起動';
+    btn.disabled = false;
+  }
+}
+
 // --- Log Panel ---
 const LOG_MAX = 200;
 let logEntries = [];
