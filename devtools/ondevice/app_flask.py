@@ -1917,8 +1917,28 @@ def auto_talk_status():
 # --- Wake words ---
 
 KWS_DIR = "/opt/wlab/sweepbot/share/ai_brain/model/voice/kws"
-KWS_FILE = os.path.join(KWS_DIR, "keywords.txt")
+KWS_BINARY_FILE = os.path.join(KWS_DIR, "keywords.txt")  # pet_voice reads this
+KWS_PERSIST_FILE = "/data/devtools/keywords.txt"           # survives reboot
 KWS_TOKENS_FILE = os.path.join(KWS_DIR, "tokens.txt")
+
+def _sync_keywords_on_boot():
+    """On startup, restore persistent keywords to the path pet_voice reads."""
+    if os.path.exists(KWS_PERSIST_FILE):
+        try:
+            import shutil
+            shutil.copy2(KWS_PERSIST_FILE, KWS_BINARY_FILE)
+        except Exception as e:
+            print(f"[KWS] sync failed: {e}")
+    elif os.path.exists(KWS_BINARY_FILE):
+        # First run: seed persistent copy from binary's file
+        try:
+            import shutil
+            shutil.copy2(KWS_BINARY_FILE, KWS_PERSIST_FILE)
+        except Exception:
+            pass
+
+
+_sync_keywords_on_boot()
 
 _bpe_tokens = None  # lazy-loaded
 
@@ -1981,8 +2001,10 @@ def _detokenize_keyword(token_line):
 
 @app.get("/api/wakewords")
 def get_wakewords():
+    # Read from persistent copy (canonical), fallback to binary path
+    src = KWS_PERSIST_FILE if os.path.exists(KWS_PERSIST_FILE) else KWS_BINARY_FILE
     try:
-        with open(KWS_FILE, "r") as f:
+        with open(src, "r") as f:
             lines = [l.strip() for l in f if l.strip()]
         keywords = []
         for line in lines:
@@ -2011,8 +2033,12 @@ def save_wakewords():
                 tok = _tokenize_keyword(kw["text"])
                 if tok:
                     lines.append(tok)
-        with open(KWS_FILE, "w") as f:
-            f.write("\n".join(lines) + "\n")
+        content = "\n".join(lines) + "\n"
+        # Write to persistent location (/data/) + binary's path
+        with open(KWS_PERSIST_FILE, "w") as f:
+            f.write(content)
+        with open(KWS_BINARY_FILE, "w") as f:
+            f.write(content)
         result = {"status": "saved", "count": len(lines)}
         if restart:
             subprocess.run(
