@@ -145,7 +145,7 @@ pcm.record {
 ./scripts/restore_aec.sh [KATA_IP]
 ```
 
-Restores `asound.conf` from backup, stops `aec_daemon`, and restarts `master`.
+Restores `asound.conf` from backup, stops `aec_daemon`, and restarts `media` + `pet_voice`.
 
 ## systemd Service (Auto-start)
 
@@ -179,9 +179,19 @@ Service file: `/data/overlay_upper/etc/systemd/system/aec-pipeline.service`
 With the AEC pipeline active, in conversation mode (`/api/conversation/enable`), detecting a wake word during TTS playback will:
 
 1. Immediately kill TTS playback (`mpg123` kill)
-2. If a question was spoken with the wake word, immediately process it through LLM → new TTS response
-3. If only wake word, return to listening state
-4. Chained barge-ins are supported (can barge-in during the new TTS response)
+2. Play a listening chime (880Hz, 200ms) to indicate listening state
+3. Flush ZMQ queue (0.5s) to discard residual wake word text
+4. Return to listening state and accumulate user speech
+5. Chained barge-ins are supported (can barge-in during the new TTS response)
+
+### Text Accumulation (Listening Phase)
+
+After entering the listening state (via wake word or barge-in), user speech is accumulated with deduplication:
+
+- **ASR streaming updates**: pet_voice sends progressive text updates within a segment. Updates with a common prefix (≥3 chars) overwrite the previous segment; otherwise a new segment is appended
+- **UTTERANCE_GAP (2s)**: When no new text arrives for 2 seconds, speech is considered complete
+- **Drain (1s)**: After the gap fires, a 1-second drain catches the final ASR update
+- Multiple segments are joined with "。" and sent to the LLM
 
 ### Related Functions (app_flask.py)
 
@@ -189,6 +199,7 @@ With the AEC pipeline active, in conversation mode (`/api/conversation/enable`),
 |----------|-------------|
 | `_tts_play_with_bargein()` | Non-blocking TTS + ZMQ monitoring. Kills TTS on wake word |
 | `_conv_respond_with_bargein()` | LLM → TTS → barge-in loop handler |
+| `_play_listening_chime()` | Plays 880Hz chime via `aplay -D tts_out` (blocking) |
 
 ## Troubleshooting
 
