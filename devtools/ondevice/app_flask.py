@@ -1819,7 +1819,7 @@ def tts_synthesize():
         return Response(audio_data, mimetype="audio/mpeg")
 
     subprocess.Popen(
-        ["mpg123", "-q", mp3_path],
+        ["mpg123", "-q", "-a", "tts_out", mp3_path],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     return jsonify({"status": "ok"})
@@ -2143,7 +2143,7 @@ def _tts_speak_on_device(text):
 
     try:
         _tts_process = subprocess.Popen(
-            ["mpg123", "-q", mp3_path],
+            ["mpg123", "-q", "-a", "tts_out", mp3_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         _tts_process.wait(timeout=60)
@@ -2179,7 +2179,7 @@ def _tts_speak_on_device_start(text):
 
     try:
         _tts_process = subprocess.Popen(
-            ["mpg123", "-q", mp3_path],
+            ["mpg123", "-q", "-a", "tts_out", mp3_path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
     except Exception as e:
