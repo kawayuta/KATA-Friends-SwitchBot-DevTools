@@ -2236,8 +2236,9 @@ def _tts_cancel():
 def _conv_respond_with_bargein(user_text, zmq_lib, sock, wake_texts):
     """Process user text through LLM, play TTS with barge-in loop.
 
-    Handles repeated barge-ins: if interrupted with a new question,
-    immediately processes it and speaks the new response.
+    Handles barge-ins during both LLM processing and TTS playback.
+    If wake word is detected during LLM processing, the LLM result is
+    discarded and the new input is processed immediately.
 
     Returns (last_response_time_or_None, last_utterance_time).
     - last_response_time is set when TTS completes normally (for wake-skip window)
@@ -2250,7 +2251,59 @@ def _conv_respond_with_bargein(user_text, zmq_lib, sock, wake_texts):
         with _conversation_lock:
             _conversation_state["phase"] = "processing"
 
-        response = _conversation_call_llm(pending_text)
+        # Run LLM in background thread so we can monitor ZMQ for barge-in
+        llm_result = [None]
+        llm_done = threading.Event()
+
+        def _llm_worker():
+            try:
+                llm_result[0] = _conversation_call_llm(pending_text)
+            except Exception as e:
+                llm_result[0] = f"[LLM error: {e}]"
+            llm_done.set()
+
+        llm_thread = threading.Thread(target=_llm_worker, daemon=True)
+        llm_thread.start()
+
+        # Monitor ZMQ for wake word while LLM is processing
+        bargein_during_llm = None
+        while not llm_done.is_set():
+            frames = _zmq_recv_multipart(zmq_lib, sock)
+            if frames is None:
+                continue
+            if len(frames) < 2:
+                continue
+            payload_str = _msgpack_decode_str(frames[1])
+            try:
+                vad_data = json.loads(payload_str)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if vad_data.get("is_wake_word"):
+                text = vad_data.get("text", "").strip()
+                extra = text
+                for wt in wake_texts:
+                    extra = extra.replace(wt, "")
+                extra = extra.strip()
+                bargein_during_llm = extra if extra else ""
+                _zmq_flush(zmq_lib, sock, duration=0)
+                print(f"[Conversation] barge-in during LLM processing, extra='{extra}'")
+                break
+
+        if bargein_during_llm is not None:
+            # Barge-in during LLM — discard result, handle new input
+            _conv_log_append("system", "ウェイクワード割り込み — LLM処理中断")
+            with _conversation_lock:
+                _conversation_state["turn_count"] = 0
+            if bargein_during_llm:
+                pending_text = bargein_during_llm
+                continue
+            else:
+                with _conversation_lock:
+                    _conversation_state["phase"] = "listening"
+                return None, time.time()
+
+        # LLM completed normally
+        response = llm_result[0]
         _conv_log_append("robot", response)
         print(f"[Conversation] robot: {response}")
 
@@ -2267,7 +2320,7 @@ def _conv_respond_with_bargein(user_text, zmq_lib, sock, wake_texts):
                 _conversation_state["phase"] = "listening"
             return now, now
 
-        # Barge-in occurred
+        # Barge-in occurred during TTS
         _conv_log_append("system", "ウェイクワード割り込み — TTS中断")
         with _conversation_lock:
             _conversation_state["turn_count"] = 0
@@ -2543,9 +2596,9 @@ def _conversation_thread(stop_event):
             with _conversation_lock:
                 phase = _conversation_state["phase"]
 
-            # Speaking phase: TTS is handled inline by _tts_play_with_bargein,
-            # so this should not normally be reached. Safety fallback.
-            if phase == "speaking":
+            # Speaking/processing phases: handled inline by _conv_respond_with_bargein
+            # (ZMQ monitoring for barge-in). Safety fallback.
+            if phase in ("speaking", "processing"):
                 continue
 
             if phase == "waiting":

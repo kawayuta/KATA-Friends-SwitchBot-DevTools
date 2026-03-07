@@ -1,11 +1,22 @@
 /*
  * aec_daemon.c — AEC (Acoustic Echo Cancellation) daemon using speexdsp
  *
- * Architecture:
- *   Reference thread: hw:1,1,0 (loopback cap, TTS ref) → ring buffer + dmix passthrough
- *   Main thread:      dsnoop (mic) + ring buffer → speex AEC → hw:1,0,1 (loopback out)
+ * 6-channel mode: processes hw:0,0 (6ch) mic input, applies AEC to 4 mic
+ * channels individually, and outputs 6ch to loopback for media/pet_voice.
  *
- * Parameters: 16kHz, S16_LE, mono, 160 samples/frame (10ms), 2048 filter length (128ms)
+ * Architecture:
+ *   Reference thread: hw:1,1,0 (loopback cap, TTS mono ref) → ring buffer + speaker
+ *   Main thread:      cap_dsnoop (6ch mic) + ring buffer → speex AEC (×4) → hw:1,0,1 (6ch loopback)
+ *
+ * Channel mapping (from RK VQE config, ref_pos: 1):
+ *   ch0: mic0 (AEC)
+ *   ch1: speaker reference (passthrough)
+ *   ch2: mic1 (AEC)
+ *   ch3: mic2 (AEC)
+ *   ch4: mic3 (AEC)
+ *   ch5: unknown (passthrough)
+ *
+ * Parameters: 16kHz, S16_LE, 160 samples/frame (10ms), 2048 filter length (128ms)
  */
 
 #include <stdio.h>
@@ -18,15 +29,23 @@
 #include <speex/speex_preprocess.h>
 
 #define SAMPLE_RATE   16000
-#define CHANNELS      1
-#define FRAME_SAMPLES 160        /* 10ms at 16kHz */
-#define FILTER_LENGTH 2048       /* 128ms tail */
-#define RING_FRAMES   256        /* ring buffer capacity in frames */
-#define FRAME_BYTES   (FRAME_SAMPLES * sizeof(int16_t))
+#define MIC_CHANNELS  6             /* 6ch from hw:0,0 */
+#define REF_CHANNELS  1             /* mono TTS reference */
+#define FRAME_SAMPLES 160           /* 10ms at 16kHz per channel */
+#define FILTER_LENGTH 2048          /* 128ms tail */
+#define RING_FRAMES   256           /* ring buffer capacity in frames */
+#define FRAME_BYTES_MONO (FRAME_SAMPLES * sizeof(int16_t))
+
+/* Indices of mic channels to apply AEC (4 mics) */
+#define NUM_AEC_CHANNELS 4
+static const int AEC_CH[NUM_AEC_CHANNELS] = {0, 2, 3, 4};
+/* Indices of passthrough channels */
+#define NUM_PASS_CHANNELS 2
+static const int PASS_CH[NUM_PASS_CHANNELS] = {1, 5};
 
 static volatile sig_atomic_t g_running = 1;
 
-/* --- Ring buffer (single-producer, single-consumer) --- */
+/* --- Ring buffer (single-producer, single-consumer, mono frames) --- */
 typedef struct {
     int16_t buf[RING_FRAMES * FRAME_SAMPLES];
     unsigned int head;  /* write position (frames) */
@@ -42,15 +61,13 @@ static void ring_init(RingBuf *r) {
 static void ring_write(RingBuf *r, const int16_t *frame) {
     pthread_mutex_lock(&r->mtx);
     unsigned int idx = r->head % RING_FRAMES;
-    memcpy(&r->buf[idx * FRAME_SAMPLES], frame, FRAME_BYTES);
+    memcpy(&r->buf[idx * FRAME_SAMPLES], frame, FRAME_BYTES_MONO);
     r->head++;
-    /* if head overtakes tail, advance tail (drop oldest) */
     if (r->head - r->tail > RING_FRAMES)
         r->tail = r->head - RING_FRAMES;
     pthread_mutex_unlock(&r->mtx);
 }
 
-/* Returns 1 if a frame was read, 0 if empty */
 static int ring_read(RingBuf *r, int16_t *frame) {
     pthread_mutex_lock(&r->mtx);
     if (r->tail == r->head) {
@@ -58,7 +75,7 @@ static int ring_read(RingBuf *r, int16_t *frame) {
         return 0;
     }
     unsigned int idx = r->tail % RING_FRAMES;
-    memcpy(frame, &r->buf[idx * FRAME_SAMPLES], FRAME_BYTES);
+    memcpy(frame, &r->buf[idx * FRAME_SAMPLES], FRAME_BYTES_MONO);
     r->tail++;
     pthread_mutex_unlock(&r->mtx);
     return 1;
@@ -67,7 +84,7 @@ static int ring_read(RingBuf *r, int16_t *frame) {
 static RingBuf g_ring;
 
 /* --- ALSA helpers --- */
-static snd_pcm_t *open_alsa(const char *dev, snd_pcm_stream_t dir) {
+static snd_pcm_t *open_alsa(const char *dev, snd_pcm_stream_t dir, unsigned int channels) {
     snd_pcm_t *pcm = NULL;
     int err;
 
@@ -84,7 +101,7 @@ static snd_pcm_t *open_alsa(const char *dev, snd_pcm_stream_t dir) {
 
     snd_pcm_hw_params_set_access(pcm, params, SND_PCM_ACCESS_RW_INTERLEAVED);
     snd_pcm_hw_params_set_format(pcm, params, SND_PCM_FORMAT_S16_LE);
-    snd_pcm_hw_params_set_channels(pcm, params, CHANNELS);
+    snd_pcm_hw_params_set_channels(pcm, params, channels);
 
     unsigned int rate = SAMPLE_RATE;
     snd_pcm_hw_params_set_rate_near(pcm, params, &rate, 0);
@@ -100,6 +117,13 @@ static snd_pcm_t *open_alsa(const char *dev, snd_pcm_stream_t dir) {
         snd_pcm_close(pcm);
         return NULL;
     }
+
+    /* Log actual parameters */
+    unsigned int actual_ch;
+    snd_pcm_hw_params_get_channels(params, &actual_ch);
+    unsigned int actual_rate;
+    snd_pcm_hw_params_get_rate(params, &actual_rate, 0);
+    printf("  opened %s: %uch, %uHz\n", dev, actual_ch, actual_rate);
 
     return pcm;
 }
@@ -118,12 +142,12 @@ static int alsa_recover(snd_pcm_t *pcm, int err) {
     return err;
 }
 
-/* --- Reference thread: capture TTS from loopback, feed ring buf + speaker --- */
+/* --- Reference thread: capture TTS from loopback (mono), feed ring buf + speaker --- */
 static void *ref_thread(void *arg) {
     (void)arg;
 
-    snd_pcm_t *cap = open_alsa("hw:1,1,0", SND_PCM_STREAM_CAPTURE);
-    snd_pcm_t *play = open_alsa("softvol_ply", SND_PCM_STREAM_PLAYBACK);
+    snd_pcm_t *cap = open_alsa("hw:1,1,0", SND_PCM_STREAM_CAPTURE, REF_CHANNELS);
+    snd_pcm_t *play = open_alsa("softvol_ply", SND_PCM_STREAM_PLAYBACK, REF_CHANNELS);
 
     if (!cap || !play) {
         fprintf(stderr, "ref_thread: failed to open devices\n");
@@ -141,10 +165,8 @@ static void *ref_thread(void *arg) {
         }
         if (n != FRAME_SAMPLES) continue;
 
-        /* Store reference for AEC */
         ring_write(&g_ring, frame);
 
-        /* Passthrough to speaker */
         snd_pcm_sframes_t w = snd_pcm_writei(play, frame, FRAME_SAMPLES);
         if (w < 0) {
             if (alsa_recover(play, w) < 0) break;
@@ -154,6 +176,26 @@ static void *ref_thread(void *arg) {
     snd_pcm_close(cap);
     snd_pcm_close(play);
     return NULL;
+}
+
+/* --- Deinterleave: 6ch interleaved → separate mono channels --- */
+static void deinterleave(const int16_t *interleaved, int16_t ch_buf[][FRAME_SAMPLES],
+                         int num_channels, int frame_samples) {
+    for (int s = 0; s < frame_samples; s++) {
+        for (int c = 0; c < num_channels; c++) {
+            ch_buf[c][s] = interleaved[s * num_channels + c];
+        }
+    }
+}
+
+/* --- Interleave: separate mono channels → 6ch interleaved --- */
+static void interleave(int16_t *interleaved, const int16_t ch_buf[][FRAME_SAMPLES],
+                       int num_channels, int frame_samples) {
+    for (int s = 0; s < frame_samples; s++) {
+        for (int c = 0; c < num_channels; c++) {
+            interleaved[s * num_channels + c] = ch_buf[c][s];
+        }
+    }
 }
 
 /* --- Signal handler --- */
@@ -169,60 +211,88 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, sig_handler);
     signal(SIGTERM, sig_handler);
 
-    printf("aec_daemon: starting (rate=%d, frame=%d, filter=%d)\n",
-           SAMPLE_RATE, FRAME_SAMPLES, FILTER_LENGTH);
+    printf("aec_daemon: starting 6ch mode (rate=%d, frame=%d, filter=%d, mics=%d)\n",
+           SAMPLE_RATE, FRAME_SAMPLES, FILTER_LENGTH, NUM_AEC_CHANNELS);
 
     ring_init(&g_ring);
 
-    /* Initialize speexdsp echo canceller */
-    SpeexEchoState *echo_st = speex_echo_state_init(FRAME_SAMPLES, FILTER_LENGTH);
+    /* Initialize 4 independent speexdsp echo cancellers (one per mic channel) */
+    SpeexEchoState *echo_st[NUM_AEC_CHANNELS];
+    SpeexPreprocessState *pp_st[NUM_AEC_CHANNELS];
     int sr = SAMPLE_RATE;
-    speex_echo_ctl(echo_st, SPEEX_ECHO_SET_SAMPLING_RATE, &sr);
 
-    /* Optional: preprocessor for residual echo suppression */
-    SpeexPreprocessState *pp_st = speex_preprocess_state_init(FRAME_SAMPLES, SAMPLE_RATE);
-    speex_preprocess_ctl(pp_st, SPEEX_PREPROCESS_SET_ECHO_STATE, echo_st);
+    for (int i = 0; i < NUM_AEC_CHANNELS; i++) {
+        echo_st[i] = speex_echo_state_init(FRAME_SAMPLES, FILTER_LENGTH);
+        speex_echo_ctl(echo_st[i], SPEEX_ECHO_SET_SAMPLING_RATE, &sr);
 
-    /* Open mic capture (dsnoop) and cleaned audio output (loopback) */
-    snd_pcm_t *mic = open_alsa("cap_dsnoop", SND_PCM_STREAM_CAPTURE);
-    snd_pcm_t *out = open_alsa("hw:1,0,1", SND_PCM_STREAM_PLAYBACK);
+        pp_st[i] = speex_preprocess_state_init(FRAME_SAMPLES, SAMPLE_RATE);
+        speex_preprocess_ctl(pp_st[i], SPEEX_PREPROCESS_SET_ECHO_STATE, echo_st[i]);
+
+        printf("  AEC instance %d for ch%d initialized\n", i, AEC_CH[i]);
+    }
+
+    /* Open mic capture (6ch from cap_dsnoop) and output (6ch to loopback) */
+    snd_pcm_t *mic = open_alsa("cap_dsnoop", SND_PCM_STREAM_CAPTURE, MIC_CHANNELS);
+    snd_pcm_t *out = open_alsa("hw:1,0,1", SND_PCM_STREAM_PLAYBACK, MIC_CHANNELS);
 
     if (!mic || !out) {
         fprintf(stderr, "main: failed to open mic/output devices\n");
         return 1;
     }
 
-    /* Start reference thread */
+    /* Start reference thread (mono TTS capture) */
     pthread_t ref_tid;
     pthread_create(&ref_tid, NULL, ref_thread, NULL);
 
-    int16_t mic_frame[FRAME_SAMPLES];
+    /* Buffers */
+    int16_t mic_interleaved[FRAME_SAMPLES * MIC_CHANNELS];
+    int16_t out_interleaved[FRAME_SAMPLES * MIC_CHANNELS];
+    int16_t ch_in[MIC_CHANNELS][FRAME_SAMPLES];
+    int16_t ch_out[MIC_CHANNELS][FRAME_SAMPLES];
     int16_t ref_frame[FRAME_SAMPLES];
-    int16_t out_frame[FRAME_SAMPLES];
+    int16_t aec_out[FRAME_SAMPLES];
 
-    printf("aec_daemon: running\n");
+    printf("aec_daemon: running (6ch)\n");
 
     while (g_running) {
-        /* Read mic input */
-        snd_pcm_sframes_t n = snd_pcm_readi(mic, mic_frame, FRAME_SAMPLES);
+        /* Read 6ch interleaved mic input */
+        snd_pcm_sframes_t n = snd_pcm_readi(mic, mic_interleaved, FRAME_SAMPLES);
         if (n < 0) {
             if (alsa_recover(mic, n) < 0) break;
             continue;
         }
         if (n != FRAME_SAMPLES) continue;
 
-        /* Try to get reference frame */
-        if (ring_read(&g_ring, ref_frame)) {
-            /* AEC processing */
-            speex_echo_cancellation(echo_st, mic_frame, ref_frame, out_frame);
-            speex_preprocess_run(pp_st, out_frame);
+        /* Deinterleave to per-channel buffers */
+        deinterleave(mic_interleaved, ch_in, MIC_CHANNELS, FRAME_SAMPLES);
+
+        /* Try to get TTS reference frame (mono) */
+        int has_ref = ring_read(&g_ring, ref_frame);
+
+        if (has_ref) {
+            /* Apply AEC to each mic channel */
+            for (int i = 0; i < NUM_AEC_CHANNELS; i++) {
+                speex_echo_cancellation(echo_st[i], ch_in[AEC_CH[i]], ref_frame, aec_out);
+                speex_preprocess_run(pp_st[i], aec_out);
+                memcpy(ch_out[AEC_CH[i]], aec_out, FRAME_BYTES_MONO);
+            }
         } else {
-            /* No TTS playing — pass mic through directly */
-            memcpy(out_frame, mic_frame, FRAME_BYTES);
+            /* No TTS playing — pass mic channels through directly */
+            for (int i = 0; i < NUM_AEC_CHANNELS; i++) {
+                memcpy(ch_out[AEC_CH[i]], ch_in[AEC_CH[i]], FRAME_BYTES_MONO);
+            }
         }
 
-        /* Write cleaned audio to loopback for pet_voice */
-        snd_pcm_sframes_t w = snd_pcm_writei(out, out_frame, FRAME_SAMPLES);
+        /* Passthrough channels (ch1: hw ref, ch5: unknown) */
+        for (int i = 0; i < NUM_PASS_CHANNELS; i++) {
+            memcpy(ch_out[PASS_CH[i]], ch_in[PASS_CH[i]], FRAME_BYTES_MONO);
+        }
+
+        /* Interleave and write 6ch output */
+        interleave(out_interleaved, (const int16_t (*)[FRAME_SAMPLES])ch_out,
+                   MIC_CHANNELS, FRAME_SAMPLES);
+
+        snd_pcm_sframes_t w = snd_pcm_writei(out, out_interleaved, FRAME_SAMPLES);
         if (w < 0) {
             if (alsa_recover(out, w) < 0) break;
         }
@@ -235,8 +305,11 @@ int main(int argc, char *argv[]) {
 
     snd_pcm_close(mic);
     snd_pcm_close(out);
-    speex_preprocess_state_destroy(pp_st);
-    speex_echo_state_destroy(echo_st);
+
+    for (int i = 0; i < NUM_AEC_CHANNELS; i++) {
+        speex_preprocess_state_destroy(pp_st[i]);
+        speex_echo_state_destroy(echo_st[i]);
+    }
 
     return 0;
 }

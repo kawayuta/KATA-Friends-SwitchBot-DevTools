@@ -1,5 +1,5 @@
 #!/bin/bash
-# Deploy AEC pipeline to device
+# Deploy AEC pipeline (6ch) to device
 # NOTE: On overlayfs, adb push to merged paths creates 0-byte files.
 # Always push to /data/devtools/ staging area then cp on device.
 set -e
@@ -14,33 +14,30 @@ fi
 
 MERGED_ASOUND="/etc/asound.conf"
 UPPER_ASOUND="/data/overlay_upper/etc/asound.conf"
-KWS_MERGED="/opt/wlab/sweepbot/share/ai_brain/model/voice/kws/config.json"
-KWS_UPPER="/data/overlay_upper/opt/wlab/sweepbot/share/ai_brain/model/voice/kws/config.json"
 LOWER_ASOUND="/app/etc/asound.conf"
-LOWER_KWS="/app/opt/wlab/sweepbot/share/ai_brain/model/voice/kws/config.json"
+SERVICE_DIR="/data/overlay_upper/etc/systemd/system"
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
 
-echo "[1/6] Backing up original configs (from lower layer)..."
+echo "[1/5] Backing up original asound.conf (from lower layer)..."
 $ADB shell "cat $LOWER_ASOUND" > "$TMPDIR/backup_asound.conf"
-$ADB shell "cat $LOWER_KWS" > "$TMPDIR/backup_kws_config.json"
 $ADB push "$TMPDIR/backup_asound.conf" /data/devtools/backup_asound.conf
-$ADB push "$TMPDIR/backup_kws_config.json" /data/devtools/backup_kws_config.json
 
-echo "[2/6] Pushing aec_daemon binary..."
+echo "[2/5] Pushing aec_daemon binary..."
 $ADB push "$BINARY" /data/devtools/aec_daemon
 $ADB shell "chmod +x /data/devtools/aec_daemon"
 
-echo "[3/6] Updating asound.conf (adding tts_out and kws_in)..."
-# Pull original, append AEC config, push back
+echo "[3/5] Updating asound.conf (adding tts_out, redirecting record to AEC output)..."
 $ADB shell "cat $LOWER_ASOUND" > "$TMPDIR/asound.conf"
-if grep -q 'pcm.tts_out' "$TMPDIR/asound.conf"; then
-    echo "  tts_out already present, skipping."
-else
-    cat >> "$TMPDIR/asound.conf" <<'ASOUND_EOF'
+
+# Remove existing AEC config if present (from previous deploy)
+sed -i.bak '/^# --- AEC pipeline/,/^$/d' "$TMPDIR/asound.conf"
+
+# Append AEC pipeline devices
+cat >> "$TMPDIR/asound.conf" <<'ASOUND_EOF'
 
 # --- AEC pipeline devices ---
-# TTS output -> loopback (for AEC reference)
+# TTS output -> loopback (for AEC reference capture)
 pcm.tts_out {
     type plug
     slave {
@@ -50,50 +47,95 @@ pcm.tts_out {
         channels 1
     }
 }
+ASOUND_EOF
 
-# AEC cleaned output for pet_voice
-pcm.kws_in {
+# Override 'record' to point to AEC output loopback (6ch)
+# media reads via default capture -> record -> now gets AEC'd audio
+if grep -q '^pcm.record' "$TMPDIR/asound.conf"; then
+    # Replace existing record definition
+    # Use python for reliable multi-line replacement
+    python3 -c "
+import re, sys
+with open('$TMPDIR/asound.conf', 'r') as f:
+    content = f.read()
+# Match pcm.record { ... } block (handles nested braces)
+pattern = r'pcm\.record\s*\{[^}]*(?:\{[^}]*\}[^}]*)*\}'
+replacement = '''pcm.record {
+    type plug
+    slave {
+        pcm \"hw:1,1,1\"
+        rate 16000
+        format S16_LE
+        channels 6
+    }
+}'''
+content = re.sub(pattern, replacement, content)
+with open('$TMPDIR/asound.conf', 'w') as f:
+    f.write(content)
+"
+else
+    cat >> "$TMPDIR/asound.conf" <<'RECORD_EOF'
+
+# Override record to read AEC output (6ch loopback)
+pcm.record {
     type plug
     slave {
         pcm "hw:1,1,1"
         rate 16000
         format S16_LE
-        channels 1
+        channels 6
     }
 }
-ASOUND_EOF
+RECORD_EOF
 fi
+
 # Push to staging area, then cp to merged + upper (overlayfs-safe)
 $ADB push "$TMPDIR/asound.conf" /data/devtools/new_asound.conf
 
-echo "[4/6] Applying asound.conf to merged + overlayfs upper..."
+echo "[4/5] Applying asound.conf to merged + overlayfs upper..."
 $ADB shell "cp /data/devtools/new_asound.conf $MERGED_ASOUND"
 $ADB shell "mkdir -p /data/overlay_upper/etc"
 $ADB shell "cp /data/devtools/new_asound.conf $UPPER_ASOUND"
 
-echo "[5/6] Updating KWS config (plughw:0,0 -> plughw:1,1,1)..."
-# Modify locally, push to staging, then cp
-sed 's|plughw:0,0|plughw:1,1,1|g' "$TMPDIR/backup_kws_config.json" > "$TMPDIR/kws_config.json"
-$ADB push "$TMPDIR/kws_config.json" /data/devtools/new_kws_config.json
-$ADB shell "cp /data/devtools/new_kws_config.json $KWS_MERGED"
-$ADB shell "mkdir -p $(dirname $KWS_UPPER)"
-$ADB shell "cp /data/devtools/new_kws_config.json $KWS_UPPER"
+echo "[5/5] Updating aec-pipeline.service and restarting..."
+# Update service with ExecStartPost sleep for media timing
+$ADB shell "cat $SERVICE_DIR/aec-pipeline.service" > "$TMPDIR/aec-pipeline.service" 2>/dev/null || true
+if [ -s "$TMPDIR/aec-pipeline.service" ]; then
+    if ! grep -q 'ExecStartPost' "$TMPDIR/aec-pipeline.service"; then
+        python3 -c "
+import re
+with open('$TMPDIR/aec-pipeline.service', 'r') as f:
+    content = f.read()
+content = re.sub(r'(ExecStart=.*)', r'\1\nExecStartPost=/bin/sleep 1', content, count=1)
+with open('$TMPDIR/aec-pipeline.service', 'w') as f:
+    f.write(content)
+"
+        $ADB push "$TMPDIR/aec-pipeline.service" /data/devtools/aec-pipeline.service
+        $ADB shell "cp /data/devtools/aec-pipeline.service $SERVICE_DIR/aec-pipeline.service"
+        $ADB shell "systemctl daemon-reload"
+    fi
+fi
 
-echo "[6/6] Starting aec_daemon and restarting pet_voice..."
-# Kill existing aec_daemon if any
-$ADB shell "start-stop-daemon -K -x /data/devtools/aec_daemon 2>/dev/null; true"
-# Start aec_daemon as daemon
-$ADB shell "start-stop-daemon -S -b -m -p /tmp/aec_daemon.pid -x /data/devtools/aec_daemon"
+# Restart aec-pipeline service (or start manually)
+if $ADB shell "systemctl is-enabled aec-pipeline" 2>/dev/null | grep -q enabled; then
+    $ADB shell "systemctl restart aec-pipeline"
+else
+    # Kill existing aec_daemon if any
+    $ADB shell "start-stop-daemon -K -x /data/devtools/aec_daemon 2>/dev/null; true"
+    # Start aec_daemon as daemon
+    $ADB shell "start-stop-daemon -S -b -m -p /tmp/aec_daemon.pid -x /data/devtools/aec_daemon"
+fi
 sleep 1
 $ADB shell "ps aux | grep aec_daemon | grep -v grep"
 
-# Restart master service (which includes pet_voice)
-$ADB shell "systemctl restart master"
+# Restart media + pet_voice (separate services) to pick up new record PCM
+$ADB shell "systemctl restart media"
+$ADB shell "systemctl restart pet_voice"
 
 echo ""
-echo "Deploy complete. AEC pipeline is active."
-echo "  TTS output  → tts_out (loopback 1,0,0)"
-echo "  AEC daemon  → mic + ref → cleaned → loopback 1,0,1"
-echo "  pet_voice   → plughw:1,1,1 (cleaned audio)"
+echo "Deploy complete. AEC pipeline (6ch) is active."
+echo "  TTS output    → tts_out (loopback 1,0,0)"
+echo "  AEC daemon    → cap_dsnoop (6ch) + ref → AEC ×4 → loopback 1,0,1 (6ch)"
+echo "  record (media)→ hw:1,1,1 (6ch AEC output)"
 echo ""
 echo "To restore: ./scripts/restore_aec.sh"
