@@ -494,6 +494,62 @@ POST http://127.0.0.1:8083/rkllm_diary
 
 ---
 
+### GET /api/wakewords — ウェイクワード一覧取得
+
+KWS の `keywords.txt` を読み込み、各行を BPE トークン列と可読テキストに変換して返す。
+
+**レスポンス:**
+```json
+{
+  "keywords": [
+    {"text": "HELLO KATA", "tokens": "▁HE LL O ▁K AT A"},
+    {"text": "HI NOAH", "tokens": "▁HI ▁NO A H"}
+  ]
+}
+```
+
+---
+
+### POST /api/wakewords — ウェイクワード保存
+
+ウェイクワードリストを `keywords.txt` に保存する。`restart: true` で `pet_voice` サービスも再起動。
+
+**リクエスト:**
+```json
+{
+  "keywords": [
+    {"text": "HELLO KATA", "tokens": "▁HE LL O ▁K AT A"},
+    {"text": "HELLO BUDDY"}
+  ],
+  "restart": true
+}
+```
+
+> `tokens` が指定されていない場合、`text` から BPE トークン列を自動生成する。
+
+**レスポンス:**
+```json
+{"status": "saved", "count": 2, "restarted": "pet_voice"}
+```
+
+---
+
+### POST /api/wakewords/tokenize — BPE トークン化プレビュー
+
+英語テキストを BPE トークン列に変換する（保存はしない）。
+
+**リクエスト:**
+```json
+{"text": "HELLO BUDDY"}
+```
+
+**レスポンス:**
+```json
+{"text": "HELLO BUDDY", "tokens": "▁HE LL O ▁BU D D Y"}
+```
+
+---
+
 ### POST /api/device/reboot — デバイス再起動
 
 `reboot` コマンドを実行してデバイスを再起動する。
@@ -514,7 +570,7 @@ POST http://127.0.0.1:8083/rkllm_diary
 {"service": "llm_diary"}
 ```
 
-**許可されたサービス:** `kata-devtools`, `llm_action`, `llm_diary`, `llm_route`, `master`
+**許可されたサービス:** `kata-devtools`, `llm_action`, `llm_diary`, `llm_route`, `master`, `pet_voice`
 
 **レスポンス:**
 ```json
@@ -1042,6 +1098,12 @@ python3 /data/pylib/zmq_publish.py '<json>'
 - 「判定のみ」→ `POST /api/action` (LLM応答確認のみ)
 - 「実行」→ `POST /api/execute` (LLM判定 → ZMQ publish)
 - Enter キーで「実行」
+- **ウェイクワード設定** (details パネル): KWS のウェイクワードを管理
+  - 現在のウェイクワード一覧（テキスト + BPE トークン列）を表示
+  - 英語テキスト入力で追加（自動 BPE トークン化、`POST /api/wakewords/tokenize`）
+  - 個別削除ボタン (✕)
+  - 「保存」→ `POST /api/wakewords`、「保存 + 再起動」→ 保存後に `pet_voice` を再起動して反映
+  - 「再読込」→ `GET /api/wakewords` でデバイスから再取得
 
 ### 2. ZMQ タブ
 
@@ -1230,6 +1292,108 @@ BLE イベントログの表示。
 | `KATA_LOCAL_PORT` | ローカル API ポート | `27999` |
 | `KATA_DEVICE_ID` | デバイス ID | (MACアドレス由来の hex 文字列) |
 | `KATA_LOCAL_TOKEN` | MD5 認証トークン (UUID) | (MQTT経由で動的取得) |
+
+---
+
+## 音声認識→アクション実行パイプライン (デバイス側)
+
+全てローカル処理。クラウド不使用。端から端まで約2〜3秒。
+
+```
+[マイク] → pet_voice (VAD→KWS→ASR)
+    → ZMQ /voice/vad_data
+    → ai_brain (voice_component)
+    → ZMQ /agent/llm_request
+    → control_center (ai_proxy)
+    → HTTP route.py (:8083) → flask_server_action (:8080)
+    → RKLLM 推論 → mood/instruction
+    → ai_brain → ZMQ /agent/start_cc_task
+    → control_center → .act ファイル実行 (サーボ/目/音声)
+```
+
+### Step 1: 常時音声検知 (`pet_voice`)
+
+| ステージ | モデル | サイズ | 処理時間 |
+|---|---|---|---|
+| VAD (音声検出) | Silero VAD (ONNX) | 643KB | 常時 |
+| KWS (ウェイクワード) | sherpa-onnx KeywordSpotter | 14MB | 126〜342ms |
+| ASR (テキスト化) | SenseVoice (RKNN) | 490MB | 298〜449ms |
+
+- **プロセス:** `/opt/wlab/sweepbot/bin/pet_voice` (ネイティブバイナリ、CPU 47%、メモリ ~1GB)
+- **サービス:** `pet_voice.service`
+- **VAD:** マイクからの音声を常時監視、人の音声区間を検出
+- **KWS:** `target_flag=1` 時にウェイクワードをチェック
+- **ASR:** SenseVoice (sherpa-onnx OfflineRecognizer) でテキスト化
+- **DOA:** マイクアレイから音源方向 (角度) を算出
+- **出力:** ZMQ `/voice/vad_data` に JSON を publish
+
+```json
+{"doa_angle": 79.0, "is_wake_word": false, "segment_id": 1690, "text": "こないのって"}
+```
+
+**ウェイクワード** (`/opt/wlab/sweepbot/share/ai_brain/model/voice/kws/keywords.txt`):
+
+sherpa-onnx KWS 形式（1行=1ウェイクワード、BPE トークン列）。英語のみ対応（学習データ: GigaSpeech-L + TTS）。
+BPE 語彙 500 トークン（`tokens.txt`）で任意の英単語を合成可能。`keywords_threshold: 0.1`。
+
+```
+▁HE LL O ▁K AT A
+▁HE LL O ▁NO A H
+▁HE LL O ▁ N IC O
+▁HI ▁K AT A
+▁HI ▁NO A H
+▁HI ▁ N IC O
+```
+
+DevTools の Action タブからウェイクワードの追加・削除・保存が可能。英語テキストを入力すると自動で BPE トークン化される。
+
+**モデルファイル:**
+
+| モデル | パス |
+|---|---|
+| VAD | `/opt/wlab/sweepbot/share/ai_brain/model/voice/silero_vad.onnx` |
+| KWS | `/opt/wlab/sweepbot/share/ai_brain/model/voice/kws/{encoder,decoder,joiner}.onnx` |
+| ASR | `/data/ai_brain/voice/sensevoice/model.rknn` |
+| ASR 語彙 | `/data/ai_brain/voice/sensevoice/tokens.txt` |
+
+### Step 2: LLM アクション判定
+
+1. `ai_brain` (voice_component) が `/voice/vad_data` を subscribe
+2. ASR テキストを `/agent/llm_request` に publish
+3. `control_center` (ai_proxy) が受信し、`route.py` (:8083) → `flask_server_action` (:8080) に HTTP POST
+4. RKLLM (NPU) が `mood/instruction` を推論（temperature=0.0, max_new_tokens=64, ~1秒）
+
+```
+"哥個唱歌" → "happy/sing"
+"こないのって" → "neutral/no_action"
+```
+
+### Step 3: アクション実行
+
+5. `route.py` がレスポンスをパース: `{"resultCode":100, "data":{"mood":"happy","instruction":"sing"}}`
+6. `control_center` → `/cc/llm_response` → `ai_brain` (voice_component)
+7. instruction → action ID に変換 (`sing` → `RSING001`)
+8. `/agent/start_cc_task` に ZMQ publish
+9. `control_center` が `.act` ファイルをロードしてサーボ・目・音声を制御
+
+### 主要プロセス一覧
+
+| プロセス | パス | 役割 |
+|---|---|---|
+| pet_voice | `/opt/wlab/sweepbot/bin/pet_voice` | VAD + KWS + ASR |
+| ai_brain | `/opt/wlab/sweepbot/lib/ai_brain/ai_brain` | 音声→LLM連携、タスク発行 |
+| control_center | `/opt/wlab/sweepbot/lib/control_center/control_center_runner` | タスク実行 (サーボ/目/音声) |
+| master | (ZMQ XPUB/XSUB プロキシ) | 全ノード間メッセージ中継 |
+
+### ログファイル
+
+| ログ | パス |
+|---|---|
+| pet_voice | `/data/cache/log/pet_voice.log` |
+| ai_brain | `/data/cache/log/ai_brain.log` |
+| LLM Action | `/data/cache/log/rkllm_action_server.log` |
+| Router | `/data/cache/log/rkllm_server.log` |
+| control_center | `/data/cache/log/cc_main.latest.log` |
 
 ---
 

@@ -1722,7 +1722,7 @@ def service_restart():
     """Restart a specific systemd service."""
     data = request.get_json(force=True)
     service = data.get("service", "")
-    allowed = ["kata-devtools", "llm_action", "llm_diary", "llm_route", "master"]
+    allowed = ["kata-devtools", "llm_action", "llm_diary", "llm_route", "master", "pet_voice"]
     if service not in allowed:
         return flask_error(400, f"service not allowed: {service}")
     try:
@@ -1912,6 +1912,128 @@ def auto_talk_status():
             "last_result": _auto_talk_state["last_result"],
             "last_time": _auto_talk_state["last_time"],
         })
+
+
+# --- Wake words ---
+
+KWS_DIR = "/opt/wlab/sweepbot/share/ai_brain/model/voice/kws"
+KWS_FILE = os.path.join(KWS_DIR, "keywords.txt")
+KWS_TOKENS_FILE = os.path.join(KWS_DIR, "tokens.txt")
+
+_bpe_tokens = None  # lazy-loaded
+
+
+def _load_bpe_tokens():
+    """Load BPE token vocabulary: token -> id mapping."""
+    global _bpe_tokens
+    if _bpe_tokens is not None:
+        return _bpe_tokens
+    _bpe_tokens = {}
+    try:
+        with open(KWS_TOKENS_FILE, "r") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) == 2:
+                    _bpe_tokens[parts[0]] = int(parts[1])
+    except Exception:
+        pass
+    return _bpe_tokens
+
+
+def _tokenize_keyword(text):
+    """Convert plain English text (e.g. 'HELLO KATA') to BPE token sequence.
+
+    Uses greedy longest-match from the token vocabulary.
+    Words are prefixed with ▁ (U+2581) as per sentencepiece convention.
+    """
+    tokens = _load_bpe_tokens()
+    if not tokens:
+        return None
+    result = []
+    words = text.strip().upper().split()
+    for i, word in enumerate(words):
+        remaining = "\u2581" + word  # ▁ prefix
+        while remaining:
+            matched = None
+            for length in range(len(remaining), 0, -1):
+                candidate = remaining[:length]
+                if candidate in tokens:
+                    matched = candidate
+                    break
+            if matched:
+                result.append(matched)
+                remaining = remaining[len(matched):]
+            else:
+                # Single char fallback
+                result.append(remaining[0])
+                remaining = remaining[1:]
+    return " ".join(result)
+
+
+def _detokenize_keyword(token_line):
+    """Convert BPE token sequence back to readable text.
+
+    e.g. '▁HE LL O ▁K AT A' -> 'HELLO KATA'
+    """
+    text = token_line.replace(" ", "").replace("\u2581", " ").strip()
+    return text
+
+
+@app.get("/api/wakewords")
+def get_wakewords():
+    try:
+        with open(KWS_FILE, "r") as f:
+            lines = [l.strip() for l in f if l.strip()]
+        keywords = []
+        for line in lines:
+            keywords.append({
+                "tokens": line,
+                "text": _detokenize_keyword(line),
+            })
+        return jsonify({"keywords": keywords})
+    except FileNotFoundError:
+        return jsonify({"keywords": [], "error": "file not found"})
+    except Exception as e:
+        return jsonify({"keywords": [], "error": str(e)})
+
+
+@app.post("/api/wakewords")
+def save_wakewords():
+    data = request.get_json(force=True)
+    keywords = data.get("keywords", [])
+    restart = data.get("restart", False)
+    try:
+        lines = []
+        for kw in keywords:
+            if kw.get("tokens"):
+                lines.append(kw["tokens"])
+            elif kw.get("text"):
+                tok = _tokenize_keyword(kw["text"])
+                if tok:
+                    lines.append(tok)
+        with open(KWS_FILE, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        result = {"status": "saved", "count": len(lines)}
+        if restart:
+            subprocess.run(
+                ["systemctl", "restart", "pet_voice"],
+                capture_output=True, timeout=15,
+            )
+            result["restarted"] = "pet_voice"
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"status": "error", "error": str(e)}), 500
+
+
+@app.post("/api/wakewords/tokenize")
+def tokenize_keyword():
+    """Preview BPE tokenization for a given text."""
+    data = request.get_json(force=True)
+    text = data.get("text", "")
+    tok = _tokenize_keyword(text)
+    if tok is None:
+        return jsonify({"error": "tokens.txt not found"}), 500
+    return jsonify({"text": text.strip().upper(), "tokens": tok})
 
 
 # --- Static file serving ---

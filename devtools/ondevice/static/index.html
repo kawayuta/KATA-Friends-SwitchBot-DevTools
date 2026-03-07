@@ -87,6 +87,25 @@
       <div id="action-result" class="bg-gray-800 rounded p-4 min-h-[100px] hidden">
         <pre class="json text-sm"></pre>
       </div>
+
+      <!-- Wake Words -->
+      <details class="mt-6 border border-gray-700 rounded-lg">
+        <summary class="px-4 py-2 cursor-pointer text-sm font-medium text-gray-300 hover:text-kata-500">ウェイクワード設定</summary>
+        <div class="px-4 pb-4 pt-2">
+          <p class="text-xs text-gray-500 mb-2">英語のウェイクワードを管理。追加時に自動でBPEトークン化されます。変更後は pet_voice を再起動して反映。</p>
+          <div id="wakeword-list" class="space-y-1 mb-3"></div>
+          <div class="flex gap-2 mb-3">
+            <input id="wakeword-new" type="text" placeholder="例: HELLO BUDDY" class="flex-1 bg-gray-800 border border-gray-600 rounded px-3 py-1.5 text-sm focus:outline-none focus:border-kata-500">
+            <button onclick="addWakeword()" class="bg-kata-500 hover:bg-kata-600 text-black font-medium px-3 py-1.5 rounded text-sm transition">追加</button>
+          </div>
+          <div class="flex gap-2">
+            <button onclick="saveWakewords(false)" class="bg-kata-500 hover:bg-kata-600 text-black font-medium px-3 py-1.5 rounded text-sm transition">保存</button>
+            <button onclick="saveWakewords(true)" class="bg-green-600 hover:bg-green-700 text-white font-medium px-3 py-1.5 rounded text-sm transition">保存 + 再起動</button>
+            <button onclick="loadWakewords()" class="bg-gray-700 hover:bg-gray-600 px-3 py-1.5 rounded text-sm transition">再読込</button>
+            <span id="wakeword-status" class="text-xs text-gray-500 self-center ml-2"></span>
+          </div>
+        </div>
+      </details>
     </div>
 
     <!-- ZMQ Tab -->
@@ -2263,7 +2282,75 @@ function truncBody(obj, max = 300) {
   return s.length > max ? s.slice(0, max) + '...' : s;
 }
 
-document.addEventListener('DOMContentLoaded', () => { initLogPanel(); loadTtsOptions(); loadLlmBackend(); loadAutoTalkConfig(); });
+// --- Wake words ---
+let wakewordData = []; // [{text, tokens}, ...]
+
+async function loadWakewords() {
+  try {
+    const data = await apiCall('/api/wakewords');
+    wakewordData = data.keywords || [];
+    renderWakewords();
+    document.getElementById('wakeword-status').textContent = '';
+  } catch (e) {
+    document.getElementById('wakeword-status').textContent = '読込エラー: ' + e.message;
+  }
+}
+
+function renderWakewords() {
+  const list = document.getElementById('wakeword-list');
+  if (!wakewordData.length) { list.innerHTML = '<p class="text-xs text-gray-500">ウェイクワードがありません</p>'; return; }
+  list.innerHTML = wakewordData.map((kw, i) => `
+    <div class="flex items-center gap-2 bg-gray-800 rounded px-3 py-1.5">
+      <span class="text-sm font-medium flex-1">${kw.text}</span>
+      <span class="text-xs text-gray-500 font-mono truncate max-w-[200px]" title="${kw.tokens}">${kw.tokens}</span>
+      <button onclick="removeWakeword(${i})" class="text-red-400 hover:text-red-300 text-xs px-1">✕</button>
+    </div>
+  `).join('');
+}
+
+function removeWakeword(idx) {
+  wakewordData.splice(idx, 1);
+  renderWakewords();
+}
+
+async function addWakeword() {
+  const input = document.getElementById('wakeword-new');
+  const text = input.value.trim().toUpperCase();
+  if (!text) return;
+  const st = document.getElementById('wakeword-status');
+  try {
+    const data = await apiCall('/api/wakewords/tokenize', {
+      method: 'POST',
+      body: JSON.stringify({ text }),
+    });
+    wakewordData.push({ text: data.text, tokens: data.tokens });
+    renderWakewords();
+    input.value = '';
+    st.textContent = '';
+  } catch (e) {
+    st.textContent = 'トークン化エラー: ' + e.message;
+  }
+}
+
+async function saveWakewords(restart) {
+  const st = document.getElementById('wakeword-status');
+  st.textContent = '保存中...';
+  try {
+    const data = await apiCall('/api/wakewords', {
+      method: 'POST',
+      body: JSON.stringify({ keywords: wakewordData, restart }),
+    });
+    st.textContent = restart ? '保存 + pet_voice 再起動完了' : '保存完了';
+    setTimeout(() => { st.textContent = ''; }, 3000);
+  } catch (e) {
+    st.textContent = 'エラー: ' + e.message;
+  }
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  initLogPanel(); loadTtsOptions(); loadLlmBackend(); loadAutoTalkConfig(); loadWakewords();
+  document.getElementById('wakeword-new').addEventListener('keydown', e => { if (e.key === 'Enter') addWakeword(); });
+});
 </script>
 
   <!-- Log Panel -->
