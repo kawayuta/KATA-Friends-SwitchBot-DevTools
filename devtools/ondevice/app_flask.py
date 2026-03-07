@@ -2042,7 +2042,7 @@ _conversation_state = {
     "thread": None,
     "stop_event": None,
     "auto_talk_was_running": False,
-    "timeout": 30,
+    "timeout": 5,
     "conversation_log": [],  # [{role, text, time}, ...] max 50
     "turn_count": 0,
     "last_response_id": None,  # LM Studio response ID for conversation continuation
@@ -2153,6 +2153,21 @@ def _tts_speak_on_device(text):
         _tts_process = None
 
 
+LISTENING_CHIME = "/data/devtools/listening_chime.wav"
+
+
+def _play_listening_chime():
+    """Play a short chime to indicate listening state. Blocks until done."""
+    try:
+        subprocess.run(
+            ["aplay", "-D", "tts_out", "-q", LISTENING_CHIME],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+    except Exception:
+        pass
+
+
 def _tts_speak_on_device_start(text):
     """Synthesize TTS and start mpg123 playback (non-blocking).
 
@@ -2209,14 +2224,10 @@ def _tts_play_with_bargein(response, zmq_lib, sock, wake_texts):
             continue
         if vad_data.get("is_wake_word"):
             _tts_cancel()
-            text = vad_data.get("text", "").strip()
-            extra = text
-            for wt in wake_texts:
-                extra = extra.replace(wt, "")
-            extra = extra.strip()
             _zmq_flush(zmq_lib, sock, duration=0)
-            print(f"[Conversation] barge-in during TTS, extra='{extra}'")
-            return extra if extra else ""
+            text = vad_data.get("text", "").strip()
+            print(f"[Conversation] barge-in during TTS (text='{text}')")
+            return ""  # always treat as wake-word-only; next utterance will be captured in listening
     _tts_process = None
     _zmq_flush(zmq_lib, sock, duration=1.0)
     return None
@@ -2280,13 +2291,9 @@ def _conv_respond_with_bargein(user_text, zmq_lib, sock, wake_texts):
                 continue
             if vad_data.get("is_wake_word"):
                 text = vad_data.get("text", "").strip()
-                extra = text
-                for wt in wake_texts:
-                    extra = extra.replace(wt, "")
-                extra = extra.strip()
-                bargein_during_llm = extra if extra else ""
+                bargein_during_llm = ""  # always treat as wake-word-only
                 _zmq_flush(zmq_lib, sock, duration=0)
-                print(f"[Conversation] barge-in during LLM processing, extra='{extra}'")
+                print(f"[Conversation] barge-in during LLM processing (text='{text}')")
                 break
 
         if bargein_during_llm is not None:
@@ -2298,6 +2305,8 @@ def _conv_respond_with_bargein(user_text, zmq_lib, sock, wake_texts):
                 pending_text = bargein_during_llm
                 continue
             else:
+                _play_listening_chime()
+                _zmq_flush(zmq_lib, sock, duration=0.5)
                 with _conversation_lock:
                     _conversation_state["phase"] = "listening"
                 return None, time.time()
@@ -2330,6 +2339,8 @@ def _conv_respond_with_bargein(user_text, zmq_lib, sock, wake_texts):
             pending_text = bargein
         else:
             # Wake word only → back to listening
+            _play_listening_chime()
+            _zmq_flush(zmq_lib, sock, duration=0.5)
             with _conversation_lock:
                 _conversation_state["phase"] = "listening"
             return None, time.time()
@@ -2607,66 +2618,139 @@ def _conversation_thread(stop_event):
                              and (time.time() - last_response_time) < WAKE_SKIP_WINDOW
                              and text and not is_wake)
                 if is_wake or wake_skip:
-                    # ウェイクワード部分をテキストから除去して質問部分を抽出
-                    extra_text = text
-                    if is_wake and extra_text:
-                        for wt in _wake_texts:
-                            extra_text = extra_text.replace(wt, "")
-                        extra_text = extra_text.strip()
-                        print(f"[Conversation] wake text='{text}', extra='{extra_text}'")
-
                     _pause_auto_talk_for_conversation()
                     with _conversation_lock:
                         _conversation_state["phase"] = "listening"
                         _conversation_state["turn_count"] = 0
 
-                    # 質問部分があればそのまま処理（ウェイクワード+質問を一息で言った場合）
-                    user_text = extra_text if is_wake else text
-                    if user_text:
-                        _conv_log_append("system", "ウェイクワード検出" if is_wake else "会話継続 (ウェイクワード省略)")
+                    if wake_skip:
+                        # 直前の応答から10秒以内 → ウェイクワード不要、テキストをそのまま処理
+                        _conv_log_append("system", "会話継続 (ウェイクワード省略)")
                         resp_time, utt_time = _conv_respond_with_bargein(
-                            user_text, zmq_lib, sock, _wake_texts)
+                            text, zmq_lib, sock, _wake_texts)
                         last_response_time = resp_time or last_response_time
                         last_utterance_time = utt_time
                         continue
                     else:
+                        # ウェイクワード検出 → listening に遷移（テキストは無視）
+                        _play_listening_chime()
+                        _zmq_flush(zmq_lib, sock, duration=0.5)
                         _conv_log_append("system", "ウェイクワード検出")
                         last_utterance_time = time.time()
-                        print("[Conversation] wake word detected, listening...")
+                        print(f"[Conversation] wake word detected (text='{text}'), listening...")
 
             elif phase == "listening":
                 if is_wake:
-                    # ウェイクワード → 会話リセット
-                    extra_text = text
-                    if extra_text:
-                        for wt in _wake_texts:
-                            extra_text = extra_text.replace(wt, "")
-                        extra_text = extra_text.strip()
+                    # ウェイクワード → 会話リセット（テキストは無視）
+                    _play_listening_chime()
+                    _zmq_flush(zmq_lib, sock, duration=0.5)
                     with _conversation_lock:
                         _conversation_state["turn_count"] = 0
                     _conv_log_append("system", "ウェイクワード — 会話リセット")
-                    print("[Conversation] wake word during listening — reset")
+                    print(f"[Conversation] wake word during listening (text='{text}') — reset")
                     last_utterance_time = time.time()
-                    if extra_text:
-                        resp_time, utt_time = _conv_respond_with_bargein(
-                            extra_text, zmq_lib, sock, _wake_texts)
-                        last_response_time = resp_time or last_response_time
-                        last_utterance_time = utt_time
                     continue
                 if not text:
                     continue
-                # ウェイクワードだけのテキストは無視
-                cleaned = text
-                for wt in _wake_texts:
-                    cleaned = cleaned.replace(wt, "")
-                if not cleaned.strip():
-                    print(f"[Conversation] ignoring wake-word-only text: '{text}'")
+
+                # テキスト蓄積: ユーザーが話し終わるまで待つ
+                # ASR はセグメント内でストリーミング更新を送る:
+                #   "ソフトバンク" → "ソフトバンクの株価" → "ソフトバンクの株価を教えて"
+                # 共通プレフィックスがあれば同一セグメントの更新 → 上書き
+                # なければ新しいセグメント → 追加
+                segments = [text]
+                last_text_time = time.time()
+                UTTERANCE_GAP = 2.0  # 秒間テキストが来なければ発話終了と判定
+                print(f"[Conversation] accumulating text: '{text}'")
+
+                def _update_segments(segments, new_text):
+                    """Update or append segment based on common prefix."""
+                    prev = segments[-1]
+                    common = 0
+                    for i in range(min(len(prev), len(new_text))):
+                        if prev[i] == new_text[i]:
+                            common += 1
+                        else:
+                            break
+                    if common >= 3:
+                        segments[-1] = new_text
+                        print(f"[Conversation] segment updated: '{new_text}'")
+                    else:
+                        segments.append(new_text)
+                        print(f"[Conversation] new segment: '{new_text}'")
+
+                got_wake = False
+                while not stop_event.is_set():
+                    acc_frames = _zmq_recv_multipart(zmq_lib, sock)
+                    if acc_frames is None:
+                        # タイムアウト — 発話終了判定
+                        if time.time() - last_text_time >= UTTERANCE_GAP:
+                            break
+                        continue
+                    if len(acc_frames) < 2:
+                        continue
+                    acc_payload = _msgpack_decode_str(acc_frames[1])
+                    try:
+                        acc_vad = json.loads(acc_payload)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+                    if acc_vad.get("is_wake_word"):
+                        got_wake = True
+                        break
+                    acc_text = acc_vad.get("text", "").strip()
+                    if acc_text:
+                        _update_segments(segments, acc_text)
+                        last_text_time = time.time()
+
+                # ギャップ発火後、ASR の最終更新をドレイン (500ms)
+                if not got_wake:
+                    drain_deadline = time.time() + 1.0
+                    buf = ctypes.create_string_buffer(4096)
+                    while time.time() < drain_deadline:
+                        rc = zmq_lib.zmq_recv(sock, buf, 4096, ZMQ_DONTWAIT)
+                        if rc < 0:
+                            time.sleep(0.05)
+                            continue
+                        drain_frames = [buf.raw[:rc]]
+                        more = ctypes.c_int(0)
+                        ms = ctypes.c_size_t(ctypes.sizeof(more))
+                        zmq_lib.zmq_getsockopt(sock, ZMQ_RCVMORE, ctypes.byref(more), ctypes.byref(ms))
+                        while more.value:
+                            rc2 = zmq_lib.zmq_recv(sock, buf, 4096, ZMQ_DONTWAIT)
+                            if rc2 > 0:
+                                drain_frames.append(buf.raw[:rc2])
+                            zmq_lib.zmq_getsockopt(sock, ZMQ_RCVMORE, ctypes.byref(more), ctypes.byref(ms))
+                        if len(drain_frames) >= 2:
+                            try:
+                                d_payload = _msgpack_decode_str(drain_frames[1])
+                                d_vad = json.loads(d_payload)
+                                if d_vad.get("is_wake_word"):
+                                    got_wake = True
+                                    break
+                                d_text = d_vad.get("text", "").strip()
+                                if d_text:
+                                    _update_segments(segments, d_text)
+                                    print(f"[Conversation] drain caught: '{d_text}'")
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+
+                if got_wake:
+                    # 蓄積中にウェイクワード → リセット
+                    _play_listening_chime()
+                    _zmq_flush(zmq_lib, sock, duration=0.5)
+                    with _conversation_lock:
+                        _conversation_state["turn_count"] = 0
+                    _conv_log_append("system", "ウェイクワード — 会話リセット")
+                    print("[Conversation] wake word during accumulation — reset")
+                    last_utterance_time = time.time()
                     continue
-                text = cleaned.strip() if cleaned.strip() != text else text
+
+                full_text = "。".join(segments)
                 last_utterance_time = time.time()
+                print(f"[Conversation] final ({len(segments)} segments): '{full_text}'")
 
                 resp_time, utt_time = _conv_respond_with_bargein(
-                    text, zmq_lib, sock, _wake_texts)
+                    full_text, zmq_lib, sock, _wake_texts)
                 last_response_time = resp_time or last_response_time
                 last_utterance_time = utt_time
 
@@ -2686,7 +2770,7 @@ def _load_conversation_config():
         with open(CONVERSATION_CONFIG_PATH, "r") as f:
             return json.load(f)
     except Exception:
-        return {"timeout": 30}
+        return {"timeout": 5}
 
 
 def _save_conversation_config(cfg):
@@ -2704,7 +2788,7 @@ def conversation_config_get():
 def conversation_config_save():
     data = request.get_json(force=True)
     cfg = {
-        "timeout": int(data.get("timeout", 30)),
+        "timeout": int(data.get("timeout", 5)),
         "mcp_servers": list(data.get("mcp_servers", [])),
         "conv_active_servers": list(data.get("conv_active_servers", [])),
     }
@@ -2720,7 +2804,7 @@ def conversation_enable():
         if _conversation_state["enabled"]:
             return jsonify({"status": "already_enabled"})
         cfg = _load_conversation_config()
-        _conversation_state["timeout"] = cfg.get("timeout", 30)
+        _conversation_state["timeout"] = cfg.get("timeout", 5)
         stop_event = threading.Event()
         t = threading.Thread(
             target=_conversation_thread, args=(stop_event,),
