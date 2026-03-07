@@ -299,6 +299,7 @@ _LLM_BACKEND_DEFAULTS = {
     "backend": "device",
     "lmstudio_url": "http://192.168.11.xx:1234/v1",
     "lmstudio_model": "",
+    "lmstudio_api_key": "",
 }
 
 
@@ -324,7 +325,7 @@ def get_llm_backend():
 def set_llm_backend():
     data = request.get_json(force=True)
     cfg = _load_llm_backend_config()
-    for key in ("backend", "lmstudio_url", "lmstudio_model"):
+    for key in ("backend", "lmstudio_url", "lmstudio_model", "lmstudio_api_key"):
         if key in data:
             cfg[key] = data[key]
     # Normalize URL: ensure /v1 suffix
@@ -342,12 +343,16 @@ def test_llm_backend():
     """Proxy connection test to LM Studio /models endpoint."""
     data = request.get_json(force=True)
     url = (data.get("url") or "").strip().rstrip("/")
+    api_key = (data.get("api_key") or "").strip()
     if not url:
         return flask_error(400, "url is required")
     if not url.endswith("/v1"):
         url += "/v1"
     try:
-        resp = requests.get(f"{url}/models", timeout=10)
+        headers = {}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        resp = requests.get(f"{url}/models", headers=headers, timeout=10)
         resp.raise_for_status()
         return jsonify(resp.json())
     except requests.ConnectionError:
@@ -407,7 +412,7 @@ def execute_action():
     return jsonify(result)
 
 
-def _lmstudio_chat(ext_url, model, messages, config):
+def _lmstudio_chat(ext_url, model, messages, config, api_key=""):
     """Send chat request to LM Studio (OpenAI compatible)."""
     payload = {
         "model": model,
@@ -416,10 +421,15 @@ def _lmstudio_chat(ext_url, model, messages, config):
         "max_tokens": int(config.get("max_new_tokens", 4096)),
         "think": False,
         "reasoning_effort": "none",
+        "store": False,
     }
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
     resp = requests.post(
         f"{ext_url}/chat/completions",
         json=payload,
+        headers=headers,
         timeout=300,
     )
     resp.raise_for_status()
@@ -430,6 +440,87 @@ def _lmstudio_chat(ext_url, model, messages, config):
     return result_text
 
 
+def _lmstudio_chat_mcp(base_url, model, messages, config, mcp_servers,
+                        api_key="", store=False, previous_response_id=None):
+    """LM Studio native API with MCP tool support.
+
+    Uses /api/v1/chat endpoint (non-OpenAI format).
+    base_url should be e.g. "http://x.x.x.x:1234" (without /v1).
+    Returns (result_text, response_id).
+    """
+    # Build input text from messages (system + user)
+    parts = []
+    for msg in messages:
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            # VLM multipart: extract text parts only (images not supported via native API)
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(item["text"])
+                elif isinstance(item, str):
+                    parts.append(item)
+        elif isinstance(content, str):
+            parts.append(content)
+    input_text = "\n\n".join(parts)
+
+    # Force tool use: prepend strong instruction in input
+    tool_names = ", ".join(mcp_servers)
+    input_text = (
+        f"<|system|>\n"
+        f"MANDATORY: You MUST call at least one tool ({tool_names}) before generating ANY text response. "
+        "Do NOT answer from your own knowledge. Do NOT skip tool calls. "
+        "First call a tool, wait for the result, then respond based ONLY on the tool output. "
+        "If you respond without calling a tool first, your response will be REJECTED.\n"
+        f"<|user|>\n{input_text}"
+    )
+
+    integrations = [{"type": "plugin", "id": s} for s in mcp_servers]
+    payload = {
+        "model": model,
+        "input": input_text,
+        "integrations": integrations,
+        "temperature": min(float(config.get("temperature", 0.7)), 1.0),
+        "context_length": int(config.get("max_new_tokens", 4096)),
+        "store": store,
+    }
+    if previous_response_id:
+        payload["previous_response_id"] = previous_response_id
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    print(f"[MCP] payload: {json.dumps(payload, ensure_ascii=False)[:500]}")
+    resp = requests.post(
+        f"{base_url}/api/v1/chat",
+        json=payload,
+        headers=headers,
+        timeout=600,
+    )
+    if resp.status_code != 200:
+        try:
+            err = resp.json().get("error", {})
+            detail = err.get("message", resp.text)
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"LM Studio /api/v1/chat {resp.status_code}: {detail}")
+    data = resp.json()
+    print(f"[MCP] response keys: {list(data.keys())}")
+    output = data.get("output", [])
+    for item in output:
+        t = item.get("type", "?")
+        c = str(item.get("content", ""))[:200]
+        print(f"[MCP]   output item: type={t}, content={c}")
+    # Extract message content from output array
+    result_parts = []
+    for item in output:
+        if item.get("type") == "message" and item.get("content"):
+            result_parts.append(item["content"])
+    result_text = "\n".join(result_parts).strip()
+    result_text = re.sub(r"<think>.*?</think>", "", result_text, flags=re.DOTALL).strip()
+    result_text = re.sub(r"<\|[^>]*\|>", "", result_text).strip()
+    response_id = data.get("id", None)
+    return result_text, response_id
+
+
 @app.post("/api/custom-llm")
 def custom_llm_call():
     """Call diary LLM with custom prompt template. Supports VLM with image."""
@@ -437,6 +528,7 @@ def custom_llm_call():
     data = request.get_json(force=True)
     text = data.get("text", "").strip()
     use_camera = data.get("use_camera", False)
+    req_mcp_servers = list(data.get("mcp_servers", []))
 
     if not text:
         return flask_error(400, "text is required")
@@ -501,6 +593,7 @@ def custom_llm_call():
         if use_lmstudio:
             try:
                 ext_url = backend_cfg["lmstudio_url"].rstrip("/")
+                model = backend_cfg.get("lmstudio_model", "")
                 messages = [
                     {"role": "system", "content": filled},
                     {"role": "user", "content": [
@@ -510,12 +603,18 @@ def custom_llm_call():
                         }},
                     ]},
                 ]
-                result_text = _lmstudio_chat(ext_url, backend_cfg.get("lmstudio_model", ""), messages, config)
+                api_key = backend_cfg.get("lmstudio_api_key", "")
+                if req_mcp_servers:
+                    base_url = re.sub(r"/v1/?$", "", ext_url)
+                    result_text, _ = _lmstudio_chat_mcp(base_url, model, messages, config, req_mcp_servers, api_key)
+                else:
+                    result_text = _lmstudio_chat(ext_url, model, messages, config, api_key)
                 return jsonify({
                     "result": result_text,
                     "prompt": filled,
                     "mode": "vlm",
                     "backend": "lmstudio",
+                    "mcp": bool(req_mcp_servers),
                 })
             except requests.ConnectionError:
                 return flask_error(502, "LM Studio unreachable")
@@ -555,15 +654,23 @@ def custom_llm_call():
     if use_lmstudio:
         try:
             ext_url = backend_cfg["lmstudio_url"].rstrip("/")
+            model = backend_cfg.get("lmstudio_model", "")
             messages = [
                 {"role": "system", "content": filled},
                 {"role": "user", "content": text},
             ]
-            result_text = _lmstudio_chat(ext_url, backend_cfg.get("lmstudio_model", ""), messages, config)
+            api_key = backend_cfg.get("lmstudio_api_key", "")
+            print(f"[Custom LLM] mcp_servers={req_mcp_servers}")
+            if req_mcp_servers:
+                base_url = re.sub(r"/v1/?$", "", ext_url)
+                result_text, _ = _lmstudio_chat_mcp(base_url, model, messages, config, req_mcp_servers, api_key)
+            else:
+                result_text = _lmstudio_chat(ext_url, model, messages, config, api_key)
             return jsonify({
                 "result": result_text,
                 "prompt": filled,
                 "backend": "lmstudio",
+                "mcp": bool(req_mcp_servers),
             })
         except requests.ConnectionError:
             return flask_error(502, "LM Studio unreachable")
@@ -1810,7 +1917,7 @@ def _auto_talk_loop(text, interval, stop_event):
                     ]
                     result_text = _lmstudio_chat(
                         ext_url, backend_cfg.get("lmstudio_model", ""),
-                        messages, config)
+                        messages, config, backend_cfg.get("lmstudio_api_key", ""))
                     result_entry["result"] = result_text
                     result_entry["mode"] = "vlm"
                 else:
@@ -1930,6 +2037,8 @@ _conversation_state = {
     "timeout": 30,
     "conversation_log": [],  # [{role, text, time}, ...] max 50
     "turn_count": 0,
+    "last_response_id": None,  # LM Studio response ID for conversation continuation
+    "last_llm_time": 0,        # timestamp of last LLM response
 }
 
 
@@ -2114,6 +2223,7 @@ def _conversation_call_llm(text):
     if backend_cfg.get("backend") == "lmstudio":
         try:
             ext_url = backend_cfg["lmstudio_url"].rstrip("/")
+            model = backend_cfg.get("lmstudio_model", "")
             messages = [
                 {"role": "system", "content": filled},
                 {"role": "user", "content": [
@@ -2123,7 +2233,32 @@ def _conversation_call_llm(text):
                     }},
                 ]},
             ]
-            return _lmstudio_chat(ext_url, backend_cfg.get("lmstudio_model", ""), messages, config)
+            # MCP tool support: use active servers for conversation mode
+            conv_cfg = _load_conversation_config()
+            active_servers = conv_cfg.get("conv_active_servers", [])
+            api_key = backend_cfg.get("lmstudio_api_key", "")
+            # Conversation continuation: reuse response_id if within 60 seconds
+            now = time.time()
+            prev_id = None
+            use_store = False
+            if _conversation_state["last_response_id"] and (now - _conversation_state["last_llm_time"]) < 60:
+                prev_id = _conversation_state["last_response_id"]
+                use_store = True
+                print(f"[Conv] Continuing conversation (prev_id={prev_id})")
+            else:
+                print("[Conv] Starting fresh conversation")
+            if active_servers:
+                base_url = re.sub(r"/v1/?$", "", ext_url)
+                result_text, resp_id = _lmstudio_chat_mcp(
+                    base_url, model, messages, config, active_servers, api_key,
+                    store=use_store, previous_response_id=prev_id)
+                _conversation_state["last_response_id"] = resp_id
+                _conversation_state["last_llm_time"] = time.time()
+                return result_text
+            result_text = _lmstudio_chat(ext_url, model, messages, config, api_key)
+            _conversation_state["last_response_id"] = None
+            _conversation_state["last_llm_time"] = time.time()
+            return result_text
         except Exception as e:
             return f"[LM Studio error: {e}]"
     else:
@@ -2178,6 +2313,8 @@ def _conversation_thread(stop_event):
         _conversation_state["phase"] = "waiting"
         _conversation_state["conversation_log"] = []
         _conversation_state["turn_count"] = 0
+        _conversation_state["last_response_id"] = None
+        _conversation_state["last_llm_time"] = 0
 
     print("[Conversation] ZMQ SUB started, waiting for wake word...")
 
@@ -2296,7 +2433,11 @@ def conversation_config_get():
 @app.post("/api/conversation/config")
 def conversation_config_save():
     data = request.get_json(force=True)
-    cfg = {"timeout": int(data.get("timeout", 30))}
+    cfg = {
+        "timeout": int(data.get("timeout", 30)),
+        "mcp_servers": list(data.get("mcp_servers", [])),
+        "conv_active_servers": list(data.get("conv_active_servers", [])),
+    }
     _save_conversation_config(cfg)
     with _conversation_lock:
         _conversation_state["timeout"] = cfg["timeout"]
@@ -2336,6 +2477,8 @@ def conversation_disable():
 
 @app.get("/api/conversation/status")
 def conversation_status():
+    conv_cfg = _load_conversation_config()
+    mcp_active = bool(conv_cfg.get("conv_active_servers"))
     with _conversation_lock:
         return jsonify({
             "enabled": _conversation_state["enabled"],
@@ -2343,6 +2486,7 @@ def conversation_status():
             "turn_count": _conversation_state["turn_count"],
             "conversation_log": _conversation_state["conversation_log"],
             "auto_talk_was_running": _conversation_state["auto_talk_was_running"],
+            "mcp_active": mcp_active,
         })
 
 

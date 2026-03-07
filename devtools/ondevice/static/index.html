@@ -264,6 +264,8 @@
         <label class="text-sm text-gray-400 flex items-center gap-1">
           <input type="checkbox" id="custom-use-camera" class="accent-indigo-500"> カメラ (VLM)
         </label>
+        <span class="text-sm text-gray-400">MCP:</span>
+        <span id="custom-mcp-chips" class="flex flex-wrap gap-1"></span>
         <label class="text-sm text-gray-400 flex items-center gap-1">
           <input type="checkbox" id="custom-tts" class="accent-indigo-500" onchange="toggleTtsOptions()"> 読み上げ (TTS)
         </label>
@@ -322,6 +324,10 @@
                 <option value="">（接続テストで取得）</option>
               </select>
             </div>
+            <div class="flex items-center gap-3">
+              <label class="text-xs text-gray-400 w-20">API Key</label>
+              <input id="lmstudio-api-key" type="password" placeholder="MCP使用時に必要" class="flex-1 bg-gray-700 border border-gray-600 rounded px-2 py-1 text-sm focus:outline-none focus:border-kata-500">
+            </div>
           </div>
           <div class="flex gap-2">
             <button onclick="testLmConnection()" id="llm-test-btn" class="bg-gray-700 hover:bg-gray-600 text-xs px-3 py-1 rounded transition">接続テスト</button>
@@ -358,6 +364,19 @@
             <input id="conv-timeout" type="number" value="30" min="5" class="w-20 bg-gray-700 border border-gray-600 rounded px-2 py-1 text-sm focus:outline-none focus:border-kata-500">
             <span class="text-xs text-gray-400">秒</span>
             <button onclick="saveConvConfig()" class="bg-gray-700 hover:bg-gray-600 text-xs px-3 py-1 rounded transition">設定保存</button>
+          </div>
+          <!-- MCP Tools -->
+          <div class="border border-gray-700 rounded p-2 space-y-2">
+            <div class="flex items-center gap-2">
+              <span class="text-xs text-gray-300 font-medium">MCP ツール</span>
+              <span class="text-xs text-gray-500">(LM Studio 限定)</span>
+            </div>
+            <div id="conv-mcp-toggles" class="flex flex-wrap gap-1 min-h-[24px]"></div>
+            <div id="conv-mcp-chips" class="flex flex-wrap gap-1 min-h-[24px]"></div>
+            <div class="flex gap-1">
+              <input id="conv-mcp-input" type="text" placeholder="例: danielsig/duckduckgo" class="flex-1 bg-gray-700 border border-gray-600 rounded px-2 py-1 text-xs focus:outline-none focus:border-kata-500" onkeydown="if(event.key==='Enter'){addMcpServer();event.preventDefault()}">
+              <button onclick="addMcpServer()" class="bg-gray-600 hover:bg-gray-500 text-xs px-2 py-1 rounded transition">+追加</button>
+            </div>
           </div>
           <div class="flex items-center gap-3">
             <button onclick="enableConversation()" id="conv-enable" class="bg-green-600 hover:bg-green-700 text-white text-xs px-3 py-1 rounded transition font-medium">有効化</button>
@@ -676,6 +695,7 @@ async function loadLlmBackend() {
     const cfg = await apiCall('/api/llm-backend');
     document.getElementById('llm-backend-select').value = cfg.backend || 'device';
     document.getElementById('lmstudio-url').value = cfg.lmstudio_url || '';
+    document.getElementById('lmstudio-api-key').value = cfg.lmstudio_api_key || '';
     toggleLmstudioFields();
     if (cfg.lmstudio_model) {
       const sel = document.getElementById('lmstudio-model');
@@ -694,6 +714,7 @@ async function saveLlmBackend() {
     backend: document.getElementById('llm-backend-select').value,
     lmstudio_url: document.getElementById('lmstudio-url').value.trim(),
     lmstudio_model: document.getElementById('lmstudio-model').value,
+    lmstudio_api_key: document.getElementById('lmstudio-api-key').value.trim(),
   };
   const status = document.getElementById('llm-backend-status');
   try {
@@ -714,9 +735,10 @@ async function testLmConnection() {
   status.textContent = '接続中...';
   status.className = 'text-xs text-gray-400 self-center';
   try {
+    const api_key = document.getElementById('lmstudio-api-key').value.trim();
     const data = await apiCall('/api/llm-backend/test', {
       method: 'POST',
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ url, api_key }),
     });
     const models = (data.data || []).map(m => m.id);
     const sel = document.getElementById('lmstudio-model');
@@ -747,10 +769,20 @@ const CONV_PHASE_LABELS = {
   speaking: '応答中 (TTS再生)',
 };
 
+let _mcpServers = [];          // master list of all MCP server IDs
+let _convActiveServers = [];   // enabled for 対話モード
+let _customActiveServers = []; // enabled for Custom LLM (session only)
+
 async function loadConvConfig() {
   try {
     const cfg = await apiCall('/api/conversation/config');
     document.getElementById('conv-timeout').value = cfg.timeout || 30;
+    _mcpServers = cfg.mcp_servers || [];
+    _convActiveServers = cfg.conv_active_servers || [];
+    _customActiveServers = [..._convActiveServers]; // init from saved
+    renderMcpManageChips();
+    renderConvMcpToggles();
+    renderCustomMcpToggles();
   } catch (e) { /* defaults */ }
   try {
     const st = await apiCall('/api/conversation/status');
@@ -766,8 +798,71 @@ async function saveConvConfig() {
   const timeout = parseInt(document.getElementById('conv-timeout').value) || 30;
   await apiCall('/api/conversation/config', {
     method: 'POST',
-    body: JSON.stringify({ timeout }),
+    body: JSON.stringify({ timeout, mcp_servers: _mcpServers, conv_active_servers: _convActiveServers }),
   });
+}
+
+// --- MCP server management (add/remove from master list) ---
+function renderMcpManageChips() {
+  const el = document.getElementById('conv-mcp-chips');
+  if (!_mcpServers.length) {
+    el.innerHTML = '<span class="text-xs text-gray-600">サーバー未登録</span>';
+    return;
+  }
+  el.innerHTML = _mcpServers.map((s, i) =>
+    `<span class="inline-flex items-center gap-1 bg-gray-700 text-xs text-gray-200 px-2 py-0.5 rounded">${escapeHtml(s)}<button onclick="removeMcpServer(${i})" class="text-gray-400 hover:text-red-400 ml-0.5">&times;</button></span>`
+  ).join('');
+}
+
+function addMcpServer() {
+  const input = document.getElementById('conv-mcp-input');
+  const val = input.value.trim();
+  if (!val) return;
+  if (_mcpServers.includes(val)) { input.value = ''; return; }
+  _mcpServers.push(val);
+  input.value = '';
+  renderMcpManageChips();
+  renderConvMcpToggles();
+  renderCustomMcpToggles();
+}
+
+function removeMcpServer(idx) {
+  const removed = _mcpServers.splice(idx, 1)[0];
+  _convActiveServers = _convActiveServers.filter(s => s !== removed);
+  _customActiveServers = _customActiveServers.filter(s => s !== removed);
+  renderMcpManageChips();
+  renderConvMcpToggles();
+  renderCustomMcpToggles();
+}
+
+// --- Toggle chips (shared renderer) ---
+function _renderToggleChips(el, servers, activeList, toggleFn) {
+  if (!servers.length) { el.innerHTML = ''; return; }
+  el.innerHTML = servers.map(s => {
+    const on = activeList.includes(s);
+    const bg = on ? 'bg-amber-600 text-black' : 'bg-gray-700 text-gray-400';
+    return `<button onclick="${toggleFn}('${escapeHtml(s)}')" class="text-xs px-2 py-0.5 rounded transition ${bg}">${escapeHtml(s)}</button>`;
+  }).join('');
+}
+
+// 対話モード toggles
+function renderConvMcpToggles() {
+  _renderToggleChips(document.getElementById('conv-mcp-toggles'), _mcpServers, _convActiveServers, 'toggleConvMcp');
+}
+function toggleConvMcp(id) {
+  const i = _convActiveServers.indexOf(id);
+  if (i >= 0) _convActiveServers.splice(i, 1); else _convActiveServers.push(id);
+  renderConvMcpToggles();
+}
+
+// Custom LLM toggles
+function renderCustomMcpToggles() {
+  _renderToggleChips(document.getElementById('custom-mcp-chips'), _mcpServers, _customActiveServers, 'toggleCustomMcp');
+}
+function toggleCustomMcp(id) {
+  const i = _customActiveServers.indexOf(id);
+  if (i >= 0) _customActiveServers.splice(i, 1); else _customActiveServers.push(id);
+  renderCustomMcpToggles();
 }
 
 function setConvUI(enabled) {
@@ -813,7 +908,9 @@ async function pollConvStatus() {
 }
 
 function renderConvStatus(st) {
-  document.getElementById('conv-phase').textContent = CONV_PHASE_LABELS[st.phase] || st.phase;
+  let phaseText = CONV_PHASE_LABELS[st.phase] || st.phase;
+  if (st.mcp_active) phaseText += ' [MCP]';
+  document.getElementById('conv-phase').textContent = phaseText;
   document.getElementById('conv-phase').className = st.phase === 'listening' || st.phase === 'processing' || st.phase === 'speaking'
     ? 'text-xs text-green-400 font-medium' : 'text-xs text-gray-400';
   renderConvLog(st.conversation_log || []);
@@ -989,20 +1086,22 @@ async function callCustomLLM() {
   const text = document.getElementById('custom-input').value.trim();
   if (!text) return;
   const useCamera = document.getElementById('custom-use-camera').checked;
+  const mcpServers = _customActiveServers.filter(s => _mcpServers.includes(s));
   const useTts = document.getElementById('custom-tts').checked;
   setLoading('custom-send', true);
   const resultEl = document.getElementById('custom-result');
   resultEl.classList.remove('hidden');
-  resultEl.querySelector('pre').textContent = useCamera ? 'カメラ撮影+VLM推論中... (最大3分)' : '推論中... (最大2分)';
+  const loadMsg = mcpServers.length ? '推論中 (MCP ツール実行含む)...' : useCamera ? 'カメラ撮影+VLM推論中... (最大3分)' : '推論中... (最大2分)';
+  resultEl.querySelector('pre').textContent = loadMsg;
   try {
     const data = await apiCall('/api/custom-llm', {
       method: 'POST',
-      body: JSON.stringify({ text, use_camera: useCamera }),
+      body: JSON.stringify({ text, use_camera: useCamera, mcp_servers: mcpServers }),
     });
     if (data.error) {
       resultEl.querySelector('pre').textContent = 'エラー: ' + data.error;
     } else {
-      const modeLabel = data.mode === 'vlm' ? '[VLM] ' : '';
+      const modeLabel = (data.mode === 'vlm' ? '[VLM] ' : '') + (data.mcp ? '[MCP] ' : '');
       const resultText = data.result || '(empty response)';
       resultEl.querySelector('pre').textContent = modeLabel + resultText;
 
