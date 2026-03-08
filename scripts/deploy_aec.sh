@@ -128,7 +128,31 @@ fi
 sleep 1
 $ADB shell "ps aux | grep aec_daemon | grep -v grep"
 
+# --- Deploy libsv_lang.so (SenseVoice ASR language override) ---
+SV_LANG_LIB="scripts/build-aloop/output/libsv_lang.so"
+if [ -f "$SV_LANG_LIB" ]; then
+    echo "[6/7] Deploying libsv_lang.so (ASR language override)..."
+    $ADB push "$SV_LANG_LIB" /data/devtools/libsv_lang.so
+
+    # Write default language config (ja) if not already present
+    $ADB shell "[ -f /data/devtools/asr_language.conf ] || echo -n ja > /data/devtools/asr_language.conf"
+
+    # Create pet_voice.service override for LD_PRELOAD
+    $ADB shell "mkdir -p /data/overlay_upper/etc/systemd/system/pet_voice.service.d/"
+    cat > "$TMPDIR/sv_lang_override.conf" <<'OVERRIDE_EOF'
+[Service]
+Environment=LD_PRELOAD=/data/devtools/libsv_lang.so
+OVERRIDE_EOF
+    $ADB push "$TMPDIR/sv_lang_override.conf" /data/devtools/sv_lang_override.conf
+    $ADB shell "cp /data/devtools/sv_lang_override.conf /data/overlay_upper/etc/systemd/system/pet_voice.service.d/override.conf"
+    $ADB shell "systemctl daemon-reload"
+else
+    echo "[6/7] libsv_lang.so not found, skipping ASR language override."
+    echo "       Run scripts/build-aloop/build_sv_lang.sh to build it."
+fi
+
 # Restart media + pet_voice (separate services) to pick up new record PCM
+echo "[7/7] Restarting media + pet_voice..."
 $ADB shell "systemctl restart media"
 $ADB shell "systemctl restart pet_voice"
 
@@ -137,5 +161,8 @@ echo "Deploy complete. AEC pipeline (6ch) is active."
 echo "  TTS output    → tts_out (loopback 1,0,0)"
 echo "  AEC daemon    → cap_dsnoop (6ch) + ref → AEC ×4 → loopback 1,0,1 (6ch)"
 echo "  record (media)→ hw:1,1,1 (6ch AEC output)"
+if [ -f "$SV_LANG_LIB" ]; then
+echo "  ASR language  → LD_PRELOAD override (libsv_lang.so)"
+fi
 echo ""
 echo "To restore: ./scripts/restore_aec.sh"

@@ -365,6 +365,19 @@
             <span class="text-xs text-gray-400">秒</span>
             <button onclick="saveConvConfig()" class="bg-gray-700 hover:bg-gray-600 text-xs px-3 py-1 rounded transition">設定保存</button>
           </div>
+          <div class="flex items-center gap-3">
+            <label class="text-xs text-gray-400 w-24">ASR言語</label>
+            <select id="asr-language" onchange="saveAsrLanguage()"
+              class="bg-gray-700 border border-gray-600 rounded px-2 py-1 text-xs">
+              <option value="auto">自動検出</option>
+              <option value="ja">日本語</option>
+              <option value="zh">中文</option>
+              <option value="en">English</option>
+              <option value="ko">한국어</option>
+              <option value="yue">粵語</option>
+            </select>
+            <span id="asr-lang-status" class="text-xs text-gray-500"></span>
+          </div>
           <!-- MCP Tools -->
           <div class="border border-gray-700 rounded p-2 space-y-2">
             <div class="flex items-center gap-2">
@@ -772,6 +785,31 @@ const CONV_PHASE_LABELS = {
 let _mcpServers = [];          // master list of all MCP server IDs
 let _convActiveServers = [];   // enabled for 対話モード
 let _customActiveServers = []; // enabled for Custom LLM (session only)
+
+async function loadAsrLanguage() {
+  try {
+    const data = await apiCall('/api/asr/language');
+    document.getElementById('asr-language').value = data.language || 'auto';
+  } catch (_) {}
+}
+
+async function saveAsrLanguage() {
+  const lang = document.getElementById('asr-language').value;
+  const st = document.getElementById('asr-lang-status');
+  st.textContent = '再起動中...';
+  st.className = 'text-xs text-yellow-400';
+  try {
+    await apiCall('/api/asr/language', {
+      method: 'POST', body: JSON.stringify({language: lang})
+    });
+    st.textContent = '適用完了';
+    st.className = 'text-xs text-green-400';
+    setTimeout(() => { st.textContent = ''; }, 3000);
+  } catch (e) {
+    st.textContent = 'エラー: ' + e.message;
+    st.className = 'text-xs text-red-400';
+  }
+}
 
 async function loadConvConfig() {
   try {
@@ -2574,7 +2612,7 @@ async function saveWakewords(restart) {
 }
 
 document.addEventListener('DOMContentLoaded', () => {
-  initLogPanel(); loadTtsOptions(); loadLlmBackend(); loadAutoTalkConfig(); loadConvConfig(); loadWakewords();
+  initLogPanel(); loadTtsOptions(); loadLlmBackend(); loadAutoTalkConfig(); loadConvConfig(); loadAsrLanguage(); loadWakewords();
   document.getElementById('wakeword-new').addEventListener('keydown', e => { if (e.key === 'Enter') addWakeword(); });
 });
 </script>

@@ -2987,6 +2987,38 @@ def save_wakewords():
         return jsonify({"status": "error", "error": str(e)}), 500
 
 
+# --- ASR Language ---
+
+ASR_LANG_CONF = "/data/devtools/asr_language.conf"
+ASR_LANG_ALLOWED = ["auto", "ja", "zh", "en", "ko", "yue"]
+
+
+@app.get("/api/asr/language")
+def asr_language_get():
+    lang = "auto"
+    try:
+        with open(ASR_LANG_CONF, "r") as f:
+            lang = f.read().strip() or "auto"
+    except FileNotFoundError:
+        pass
+    return jsonify({"language": lang})
+
+
+@app.post("/api/asr/language")
+def asr_language_set():
+    data = request.get_json(force=True)
+    lang = data.get("language", "auto")
+    if lang not in ASR_LANG_ALLOWED:
+        return flask_error(400, f"invalid language: {lang}")
+    with open(ASR_LANG_CONF, "w") as f:
+        f.write(lang)
+    subprocess.run(
+        ["systemctl", "restart", "pet_voice"],
+        capture_output=True, timeout=15,
+    )
+    return jsonify({"status": "ok", "language": lang})
+
+
 @app.post("/api/wakewords/tokenize")
 def tokenize_keyword():
     """Preview BPE tokenization for a given text."""
